@@ -1,0 +1,17 @@
+{
+  "name": "god-template-autopilot",
+  "version": "1.0.0",
+  "description": "Autopilot watcher + Mission Control dashboard",
+  "type": "module",
+  "scripts": {
+    "start": "node watcher.js",
+    "watch": "node watcher.js",
+    "dashboard": "node dashboard.js",
+    "full": "node -e \"import('./watcher.js'); import('./dashboard.js');\""
+  },
+  "dependencies": {
+    "chokidar": "^4.0.0",
+    "express": "^4.18.0",
+    "ws": "^8.16.0"
+  }
+}
