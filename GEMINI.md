@@ -24,14 +24,14 @@ Before responding to anything the user says, silently read:
 2. `AGENT_STATUS.md` — is Claude mid-task or blocked right now?
 3. `.autopilot-state.json` — current machine state
 4. `PROJECT_CONTEXT.md` — architecture understanding (if exists)
-5. `CODEBASE_INDEX.md` — technical map (if exists)
+5. `.gitnexus/` — dynamic knowledge graph (use `gitnexus` tools to explore)
 
 Then **lead with a briefing** — even if the user just said "hey":
 
 > "Hey! Last time we were working on [X]. We got [Y] done. [Z] is still in progress. [Anything important they should know.] Want to pick up where we left off, or something else on your mind?"
 
 If nothing exists (brand new project): tell them it's a fresh start and ask what they want to build.
-If codebase exists but was never mapped (`CODEBASE_INDEX.md` missing): **do not ask — immediately write the onboarding plan and trigger autopilot**. Tell the user: "I don't have a map of this codebase yet — I'm scanning it now before we do anything else."
+If codebase exists but was never mapped (`.gitnexus/` missing): **do not ask — immediately write the onboarding plan and trigger autopilot to run `gitnexus analyze`**. Tell the user: "I don't have a map of this codebase yet — I'm scanning it now before we do anything else."
 If autopilot is blocked: tell them immediately in plain English what's stuck and what decision is needed from them.
 If Claude just finished (AGENT_STATUS = complete): review the output, summarize what changed, and suggest the next logical step before the user has to ask.
 
@@ -88,7 +88,7 @@ Never write a plan without first understanding the codebase. Use every tool avai
 - `impact("[Symbol]")` — blast radius before touching anything
 
 **File reading** (targeted, after GitNexus narrows it down):
-- Load `CODEBASE_INDEX.md` first — it's the map
+- Use GitNexus tools first — they build the contextual map
 - Load `PROJECT_CONTEXT.md` for architecture understanding
 - Read specific files only — never scan everything
 
@@ -139,7 +139,7 @@ Workflows are defined in `.agents/workflows/`. Read them to know exactly what to
 
 ## Onboarding an Existing Project
 
-When the user brings you into a project for the first time (you don't have `CODEBASE_INDEX.md`):
+When the user brings you into a project for the first time (you don't have `.gitnexus/` folder):
 
 **You do not wait for the user to tell you to onboard. You do it automatically.**
 
@@ -147,7 +147,7 @@ When the user brings you into a project for the first time (you don't have `CODE
 2. Write `PLAN.md` with the onboarding tasks (see below) — **do not ask the user to do this**.
 3. Write `.autopilot-state.json` with `status: "in_progress"` to trigger Claude automatically.
 4. Tell the user: "I've kicked off a codebase scan — Claude is mapping everything now. I'll brief you when it's done."
-5. When Claude finishes: read `CODEBASE_INDEX.md`, write `PROJECT_CONTEXT.md` with your architectural understanding.
+5. When Claude finishes: run GitNexus queries to build your architectural understanding in `PROJECT_CONTEXT.md`.
 6. Brief the user: "Okay, I've got the full picture. Here's what I found: [summary of stack, architecture, hotspots, tech debt]. What do you want to work on first?"
 
 **The onboarding PLAN.md you write:**
@@ -155,9 +155,8 @@ When the user brings you into a project for the first time (you don't have `CODE
 # Plan: Codebase Onboarding
 
 ## Tasks
-- [ ] T1: Generate CODEBASE_INDEX.md — run codebase-onboard skill (see .agents/skills/codebase-onboard.md)
-- [ ] T2: Run `gitnexus analyze` in the project root to build the knowledge graph
-- [ ] T3: Report any immediately obvious issues (missing .env vars, broken imports, failing tests)
+- [ ] T1: Run `gitnexus analyze` in the project root to build the dynamic knowledge graph
+- [ ] T2: Report any immediately obvious issues (missing .env vars, broken imports, failing tests)
 ```
 
 **GitNexus check**: If `.gitnexus/` does not exist in the project root, always include `gitnexus analyze` as a task. Never skip this — it's what lets you investigate efficiently for every future plan.
@@ -166,7 +165,7 @@ When the user brings you into a project for the first time (you don't have `CODE
 - User mentions "existing project", "production app", "here's my repo", "I have an app already"
 - User pastes a GitHub URL
 - User says anything that implies there's already a codebase ("we built...", "the app does...", "there's a bug in...")
-- `CODEBASE_INDEX.md` doesn't exist but the directory has code files
+- `.gitnexus/` directory doesn't exist but the directory has code files
 
 In all these cases: **start onboarding immediately, don't ask permission.**
 
@@ -224,8 +223,7 @@ Present proposed changes to the user before applying. Never silently modify fram
 
 ## Token Efficiency
 
-- Load `CODEBASE_INDEX.md` before exploring files — it's the map
-- Use GitNexus tools instead of reading files when possible
+- Use GitNexus queries before exploring files manually — it's the map
 - Read files by section, not fully, when you do need them
 - Ask Claude to grep/search and return results rather than loading whole directories
 - Query NotebookLM for Claude Code syntax instead of guessing

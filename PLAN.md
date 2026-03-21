@@ -1,53 +1,38 @@
-# Plan: [Task Name]
+# Plan: Autopilot Test
 
-**Status**: `[ ] In Progress` | `[ ] Blocked` | `[ ] Done`
-**Date**: YYYY-MM-DD
-**Requested by**: [user / Gemini]
+**Status**: `[x] In Progress`
+**Date**: 2026-03-21
+**Requested by**: Emile
 **Assigned to**: Claude Code
-**Phase**: 1 of N
+**Phase**: 1 of 1
 
 ---
 
 ## Context
-_Why this is being done. What problem is being solved. What the user asked for._
+This is a simple test to verify the autopilot loop works end-to-end.
 
 ---
 
 ## Architecture Decisions
-_Key design decisions made by Gemini. Claude must not deviate from these without writing a Blocker first._
-
-- **Decision 1**: [what and why]
-- **Decision 2**: [what and why]
+- None — this is a trivial test task.
 
 ---
 
 ## Tasks
-- [ ] **T1**: [Specific action] — files: `path/to/file.ts`, `path/to/other.ts`
-- [ ] **T2**: [Specific action] — files: `path/to/file.ts`
-- [ ] **T3**: Write/update tests for T1 and T2 — files: `path/to/file.test.ts`
+- [ ] **T1**: Create a file called `autopilot-test.txt` in the project root with the content "Autopilot loop works! 🎉"
 
 ---
 
 ## Constraints
-_Things Claude must NOT touch or change._
-
-- DO NOT modify: `[file or area]`
-- DO NOT change: `[pattern or behavior]`
-- Keep backward compatible: `[interface or API]`
+- DO NOT modify any existing files
+- DO NOT install any packages
 
 ---
 
 ## Blockers
-_Claude writes here when stuck. Gemini reads and resolves._
-
-<!-- Format: - [YYYY-MM-DD] T# blocked: [description of problem and what decision is needed] -->
 
 ---
 
 ## Test Criteria
-_Verifiable conditions that confirm the plan is complete._
-
-- [ ] `npm test` passes with no failures
-- [ ] `npm run build` succeeds with no TypeScript errors
-- [ ] [Specific behavior]: [how to verify it]
-- [ ] No regressions in [related area]
+- [ ] `autopilot-test.txt` exists in the project root
+- [ ] Its content is "Autopilot loop works! 🎉"
