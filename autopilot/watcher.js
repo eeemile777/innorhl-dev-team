@@ -191,11 +191,11 @@ function _spawnClaude() {
 
   claudeProcess = spawn('claude', [
     '--print',
+    '--dangerously-skip-permissions',
     'Read PLAN.md and execute all unchecked tasks in order. Follow the instructions in CLAUDE.md.'
   ], {
     cwd: PROJECT_ROOT,
     stdio: 'inherit',
-    shell: true
   });
 
   claudeProcess.on('close', (code) => {

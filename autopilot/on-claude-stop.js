@@ -49,8 +49,12 @@ function writeState(patch) {
 // ── PLAN.md task counting (regex stays here — NOT in watcher) ─────────────────
 
 function countTasks(content) {
-  const total = (content.match(/^- \[[ x]\]/gm) || []).length;
-  const done  = (content.match(/^- \[x\]/gm) || []).length;
+  // Only count checkboxes in the ## Tasks section, not Test Criteria or other sections
+  const tasksSection = content.split('## Tasks')[1];
+  if (!tasksSection) return { total: 0, done: 0, remaining: 0 };
+  const tasksOnly = tasksSection.split('##')[0]; // stop at next section
+  const total = (tasksOnly.match(/^- \[[ x]\]/gm) || []).length;
+  const done  = (tasksOnly.match(/^- \[x\]/gm) || []).length;
   return { total, done, remaining: total - done };
 }
 
@@ -58,7 +62,13 @@ function hasBlockers(content) {
   const blockersSection = content.split('## Blockers')[1];
   if (!blockersSection) return false;
   const nextSection = blockersSection.split('##')[0];
-  return nextSection.trim().replace(/<!--.*?-->/gs, '').trim().length > 0;
+  // Strip HTML comments, template placeholders (italic text), and horizontal rules
+  const cleaned = nextSection
+    .replace(/<!--.*?-->/gs, '')
+    .replace(/^_.*_$/gm, '')
+    .replace(/^---$/gm, '')
+    .trim();
+  return cleaned.length > 0;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

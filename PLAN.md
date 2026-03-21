@@ -19,7 +19,7 @@ This is a simple test to verify the autopilot loop works end-to-end.
 ---
 
 ## Tasks
-- [ ] **T1**: Create a file called `autopilot-test.txt` in the project root with the content "Autopilot loop works! 🎉"
+- [ ] **T1**: Create a file called `autopilot-test.txt` in the project root with the content "Autopilot loop works!"
 
 ---
 
@@ -35,4 +35,4 @@ This is a simple test to verify the autopilot loop works end-to-end.
 
 ## Test Criteria
 - [ ] `autopilot-test.txt` exists in the project root
-- [ ] Its content is "Autopilot loop works! 🎉"
+- [ ] Its content is "Autopilot loop works!"
