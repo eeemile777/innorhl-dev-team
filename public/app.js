@@ -101,7 +101,12 @@ function connect(password) {
   ws.onclose = () => {
     statusDot.classList.remove('connected');
     statusDot.classList.add('error');
-    if (!loginScreen.classList.contains('hidden')) return;
+    if (!loginScreen.classList.contains('hidden')) {
+      loginBtn.disabled = false;
+      loginBtn.textContent = 'Enter';
+      if (loginError) { loginError.textContent = 'Connection failed. Is the server running?'; loginError.style.display = 'block'; }
+      return;
+    }
     setTimeout(() => connect(password), reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   };
@@ -124,18 +129,26 @@ function handleMessage(msg) {
       }
       break;
 
-    case 'error':
-      if (!loginScreen.classList.contains('hidden')) {
-        loginError.classList.remove('hidden');
-        loginBtn.disabled = false;
-        loginBtn.textContent = 'Enter';
+    case 'error': {
+      const loginScreen = $('login-screen');
+      if (loginScreen && loginScreen.style.display !== 'none') {
+        // During login — show in login UI
+        const errEl = $('login-error');
+        if (errEl) { errEl.textContent = msg.text; errEl.style.display = 'block'; }
+      } else {
+        // Post-auth — show as toast notification
+        showToast(msg.text, 'error');
       }
       break;
+    }
 
     case 'overview':
       projects = msg.projects || [];
       renderProjectList();
       if (!activeProjectId && projects.length > 0) selectProject(projects[0].id);
+      if (msg.gemini_available === false) {
+        showToast('Warning: Gemini CLI not found — autopilot Q&A disabled', 'warn');
+      }
       break;
 
     case 'project-state':
@@ -162,11 +175,8 @@ function handleMessage(msg) {
 
     case 'session-state': {
       const ssIdx = allSessions.findIndex(s => s.sessionId === msg.sessionId);
-      if (ssIdx !== -1) {
-        allSessions[ssIdx] = { ...allSessions[ssIdx], ...msg };
-      } else {
-        allSessions.push(msg);
-      }
+      if (ssIdx === -1) break; // not in our current project's sessions — ignore
+      allSessions[ssIdx] = { ...allSessions[ssIdx], ...msg };
       renderSessionCards();
       renderSessionsOverview();
       renderAgentsSessionSelect();
@@ -254,6 +264,10 @@ function handleMessage(msg) {
       }
       break;
 
+    case 'graph-data':
+      if (msg.projectId === activeProjectId) renderCodeGraph(msg);
+      break;
+
     case 'usage-data':
       if (msg.projectId === activeProjectId) renderUsage(msg);
       break;
@@ -276,6 +290,45 @@ function handleMessage(msg) {
         }
       }
       break;
+
+    case 'autopilot-status': {
+      // Real-time autopilot state transitions from the server reactor
+      const { projectId, sessionId, status, reason, exitCode } = msg;
+
+      // Update agent badge in header
+      if (projectId === activeProjectId || !projectId) {
+        updateAgentBadge(status);
+      }
+
+      // Notifications for important state changes
+      if (status === 'completed') {
+        notify('Autopilot Complete', `All tasks finished${sessionId ? ` (${sessionId})` : ''}`);
+      } else if (status === 'blocked') {
+        notify('Autopilot Blocked', reason || 'Manual intervention needed');
+      } else if (status === 'running') {
+        // Claude just spawned — update UI
+        appendLog('info', `Claude spawned${sessionId ? ` for session ${sessionId}` : ''}`, new Date().toISOString());
+      }
+
+      // Refresh project state to get latest data
+      if (ws && projectId === activeProjectId) {
+        ws.send(JSON.stringify({ type: 'select-project', projectId }));
+      }
+      break;
+    }
+
+    case 'autopilot-started':
+      showToast('Autopilot started — Claude is executing the plan', 'info');
+      break;
+
+    case 'merge-success':
+      notify('Merge Complete', `Session "${msg.sessionId}" merged to main`);
+      if (ws) ws.send(JSON.stringify({ type: 'list-sessions' }));
+      break;
+
+    case 'info':
+      showToast(msg.text || msg.message, 'info');
+      break;
   }
 }
 
@@ -287,16 +340,34 @@ function updateProjectInList(msg) {
 }
 
 function renderProjectList() {
-  projectList.innerHTML = projects.map(p => {
+  projectList.innerHTML = '';
+  projects.forEach(p => {
     const status = p.autopilot?.status || 'idle';
     const active = p.id === activeProjectId ? 'active' : '';
     const taskInfo = p.total > 0 ? `${p.done}/${p.total}` : '';
-    return `<div class="project-item ${active}" onclick="selectProject('${p.id}')">
+    const item = document.createElement('div');
+    item.className = `project-item ${active}`;
+    item.innerHTML = `
       <span class="project-dot ${status}"></span>
       <span class="project-name">${escHtml(p.name)}</span>
       ${taskInfo ? `<span class="project-tasks">${taskInfo}</span>` : ''}
-    </div>`;
-  }).join('');
+    `;
+    item.addEventListener('click', () => selectProject(p.id));
+    if (p.id !== 'innorhl') {
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'btn-xs danger';
+      removeBtn.title = 'Remove project';
+      removeBtn.textContent = '×';
+      removeBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (confirm(`Remove project "${p.name}" from dashboard?`)) {
+          ws.send(JSON.stringify({ type: 'remove-project', projectId: p.id }));
+        }
+      };
+      item.appendChild(removeBtn);
+    }
+    projectList.appendChild(item);
+  });
 }
 
 function selectProject(id) {
@@ -314,11 +385,9 @@ function selectProject(id) {
   }
 
   activeAgentsSession = null;
-  logStarted = false;
+  codeGraphData = null; // reset so code graph reloads for new project
   logOutput.innerHTML = '<div class="log-entry dimmed">Waiting for events...</div>';
   $('agent-conversation').innerHTML = '<div class="dimmed" style="padding:12px">Loading...</div>';
-  $('files-sub').textContent = '—';
-
   if (window.innerWidth <= 700) { sidebar.classList.remove('open'); sidebarOpen = false; }
   switchView('project');
 }
@@ -356,6 +425,30 @@ document.querySelectorAll('.sidebar-nav-btn').forEach(btn => {
   btn.addEventListener('click', () => switchView(btn.dataset.view));
 });
 
+// ─── Agent Badge ──────────────────────────────────────────────────────────────
+
+const badgeMap = {
+  idle: 'idle', in_progress: 'running', testing: 'testing',
+  waiting_for_gemini: 'gemini', awaiting_review: 'reviewing',
+  needs_revision: 'revision', needs_restart: 'restarting',
+  blocked: 'blocked', complete: 'complete', completed: 'complete',
+  partial: 'partial', error: 'error', stopped: 'idle',
+};
+const badgeLabels = {
+  idle: 'IDLE', in_progress: 'CLAUDE RUNNING', testing: 'RUNNING TESTS',
+  waiting_for_gemini: 'GEMINI ANSWERING', awaiting_review: 'GEMINI REVIEWING',
+  needs_revision: 'REVISION NEEDED', needs_restart: 'RESTARTING',
+  blocked: 'BLOCKED', complete: 'COMPLETE', completed: 'COMPLETE',
+  partial: 'PARTIAL', error: 'ERROR', stopped: 'STOPPED',
+};
+
+function updateAgentBadge(status) {
+  if (!agentBadge) return;
+  agentBadge.className = 'agent-badge';
+  agentBadge.classList.add(badgeMap[status] || 'idle');
+  agentBadge.textContent = badgeLabels[status] || status.replace(/_/g, ' ').toUpperCase();
+}
+
 // ─── State rendering ──────────────────────────────────────────────────────────
 
 function renderProjectState(state) {
@@ -366,8 +459,9 @@ function renderProjectState(state) {
     idle: 'var(--text-muted)', in_progress: 'var(--accent)',
     testing: 'var(--cyan)', waiting_for_gemini: 'var(--purple)',
     awaiting_review: 'var(--yellow)', needs_revision: 'var(--orange)',
-    blocked: 'var(--orange)', complete: 'var(--green)',
-    partial: 'var(--yellow)', error: 'var(--red)',
+    needs_restart: 'var(--cyan)', blocked: 'var(--orange)',
+    complete: 'var(--green)', completed: 'var(--green)',
+    partial: 'var(--yellow)', error: 'var(--red)', stopped: 'var(--text-muted)',
   };
 
   const hero = $('status-hero');
@@ -377,29 +471,15 @@ function renderProjectState(state) {
   const statusIcons = {
     idle: '⏸', in_progress: '⚡', testing: '🧪',
     waiting_for_gemini: '🧠', awaiting_review: '🔍',
-    needs_revision: '✏️', blocked: '🚧',
-    complete: '✅', partial: '⏳', error: '❌',
+    needs_revision: '✏️', needs_restart: '🔄', blocked: '🚧',
+    complete: '✅', completed: '✅', partial: '⏳', error: '❌', stopped: '⏹',
   };
   if (icon) icon.textContent = statusIcons[status] || '⏸';
 
   autopilotStatus.textContent = status.replace(/_/g, ' ');
   autopilotStatus.style.color = statusColors[status] || 'var(--text)';
 
-  const badgeMap = {
-    idle: 'idle', in_progress: 'running', testing: 'testing',
-    waiting_for_gemini: 'gemini', awaiting_review: 'reviewing',
-    needs_revision: 'revision', blocked: 'blocked',
-    complete: 'complete', partial: 'partial', error: 'error',
-  };
-  const badgeLabels = {
-    idle: 'IDLE', in_progress: 'CLAUDE RUNNING', testing: 'RUNNING TESTS',
-    waiting_for_gemini: 'GEMINI ANSWERING', awaiting_review: 'GEMINI REVIEWING',
-    needs_revision: 'REVISION NEEDED', blocked: 'BLOCKED',
-    complete: 'COMPLETE', partial: 'PARTIAL', error: 'ERROR',
-  };
-  agentBadge.className = 'agent-badge';
-  agentBadge.classList.add(badgeMap[status] || 'idle');
-  agentBadge.textContent = badgeLabels[status] || status.replace(/_/g, ' ').toUpperCase();
+  updateAgentBadge(status);
 
   const done  = state.done  || 0;
   const total = state.total || 0;
@@ -424,9 +504,12 @@ function renderProjectState(state) {
   btnPause.disabled  = !['in_progress','waiting_for_gemini','awaiting_review','needs_revision','testing'].includes(status);
   btnResume.disabled = !['blocked','partial'].includes(status);
 
+  const btnStart = $('btn-start-autopilot');
+  if (btnStart) {
+    btnStart.style.display = ['idle','completed','complete','stopped'].includes(status) ? '' : 'none';
+  }
+
   updateAgentGraph(state);
-  const filesSubEl = $('files-sub');
-  if (filesSubEl) filesSubEl.textContent = (state.tasks || []).length ? `${(state.tasks||[]).length} tasks` : '—';
 }
 
 // Render all session tasks in the Tasks tab (grouped by session)
@@ -457,19 +540,6 @@ function renderSessionTasksInTab() {
     </div>`;
   }).join('');
   taskList.innerHTML = html;
-}
-
-function renderTasks(tasks) {
-  if (!tasks.length) { taskList.innerHTML = '<div class="dimmed">No tasks loaded</div>'; return; }
-  taskList.innerHTML = tasks.map((t, i) => {
-    const cls      = t.done ? 'done' : (i === tasks.findIndex(x => !x.done) ? 'active' : '');
-    const checkCls = t.done ? 'done' : (cls === 'active' ? 'active' : 'pending');
-    const icon     = t.done ? '✓' : (cls === 'active' ? '▶' : '○');
-    return `<div class="task-item ${cls}">
-      <span class="task-check ${checkCls}">${icon}</span>
-      <span class="task-text ${t.done ? 'done' : ''}">${escHtml(t.text)}</span>
-    </div>`;
-  }).join('');
 }
 
 // ─── Session Cards + Modal System ─────────────────────────────────────────────
@@ -674,6 +744,10 @@ window.openSessionModal = openSessionModal;
 function closeSessionModal() {
   activeModalSessionId = null;
   modalReady = false;
+  if (window._modalResizeObserver) {
+    window._modalResizeObserver.disconnect();
+    window._modalResizeObserver = null;
+  }
   if (modalTerminal) {
     try { modalTerminal.dispose(); } catch {}
     modalTerminal = null; modalFitAddon = null;
@@ -725,7 +799,8 @@ function initModalTerminal(sessionId) {
   });
 
   if (typeof ResizeObserver !== 'undefined') {
-    const ro = new ResizeObserver(() => {
+    if (window._modalResizeObserver) window._modalResizeObserver.disconnect();
+    window._modalResizeObserver = new ResizeObserver(() => {
       if (!modalTerminal || !modalFitAddon) return;
       try {
         modalFitAddon.fit();
@@ -735,7 +810,7 @@ function initModalTerminal(sessionId) {
         }));
       } catch {}
     });
-    ro.observe(canvas);
+    window._modalResizeObserver.observe(canvas);
   }
 }
 
@@ -806,6 +881,11 @@ function updateModalContent(sessionId) {
   if (!session) return;
   updateModalBadge(session.status || 'idle');
 
+  const btnExec = $('btn-execute-plan');
+  if (btnExec) {
+    btnExec.style.display = (session.status === 'idle') ? '' : 'none';
+  }
+
   const statusPanel = $('modal-panel-status');
   if (statusPanel) {
     const color = STATUS_COLOR[session.status] || 'var(--text-muted)';
@@ -859,6 +939,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     }
     if (tab.dataset.tab === 'agents') {
       requestAgentsData();
+      renderAgentFlow();
     }
     if (tab.dataset.tab === 'usage' && ws && ws.readyState === WebSocket.OPEN && activeProjectId) {
       ws.send(JSON.stringify({ type: 'get-usage', projectId: activeProjectId }));
@@ -901,11 +982,8 @@ function renderLogTab() {
   logOutput.innerHTML = html;
 }
 
-// Keep appendLog for real-time server events (used internally, not shown in log tab)
-let logStarted = false;
-function appendLog(level, text, time) {
-  logStarted = true; // suppress old behavior silently
-}
+// appendLog is a no-op stub; real-time events are shown via showToast or activity feed
+function appendLog(level, text, time) {}
 
 // ─── Activity Feed ────────────────────────────────────────────────────────────
 
@@ -943,6 +1021,18 @@ function doAction(action) {
 }
 window.doAction = doAction;
 
+function startAutopilot() {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'start-autopilot', projectId: activeProjectId }));
+}
+window.startAutopilot = startAutopilot;
+
+function executeSessionPlan() {
+  if (!ws || ws.readyState !== 1 || !activeModalSessionId) return;
+  ws.send(JSON.stringify({ type: 'start-autopilot', projectId: activeProjectId, sessionId: activeModalSessionId }));
+}
+window.executeSessionPlan = executeSessionPlan;
+
 // ─── Add Project Modal ────────────────────────────────────────────────────────
 
 function refreshAllTemplates() {
@@ -950,6 +1040,15 @@ function refreshAllTemplates() {
   ws.send(JSON.stringify({ type: 'refresh-template' })); // no projectId = all projects
 }
 window.refreshAllTemplates = refreshAllTemplates;
+
+function analyzeCurrentProject() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!activeProjectId) { showToast('Select a project first', 'warn'); return; }
+  const btn = $('btn-analyze-project');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Analyzing...'; setTimeout(() => { btn.disabled = false; btn.textContent = '⚡ Build Code Graph'; }, 30000); }
+  ws.send(JSON.stringify({ type: 'analyze-project', projectId: activeProjectId }));
+}
+window.analyzeCurrentProject = analyzeCurrentProject;
 
 $('btn-add-project').addEventListener('click', () => {
   $('modal-overlay').classList.remove('hidden');
@@ -984,144 +1083,472 @@ window.addProject = addProject;
 
 $('new-project-desc').addEventListener('keydown', (e) => { if (e.key === 'Enter') addProject(); });
 
-// ─── Agent Graph ──────────────────────────────────────────────────────────────
+// ─── Agents Sub-tabs ─────────────────────────────────────────────────────────
 
-let d3Env = null;
+function switchAgentsSubtab(name) {
+  document.querySelectorAll('.agents-subtab').forEach(b => b.classList.toggle('active', b.dataset.subtab === name));
+  document.querySelectorAll('.agents-subpanel').forEach(p => p.classList.remove('active'));
+  const panel = $('subpanel-' + name);
+  if (panel) panel.classList.add('active');
+  if (name === 'code-graph' && !codeGraphData) requestCodeGraph();
+  if (name === 'flow') renderAgentFlow();
+}
+window.switchAgentsSubtab = switchAgentsSubtab;
 
-function initD3Graph(containerId) {
-  if (d3Env && d3Env.simulation) d3Env.simulation.stop();
-  const container = $(containerId);
-  if (!container) return null;
+// ─── Agent Flow Graph (SVG, hand-crafted pipeline) ───────────────────────────
+
+let lastFlowStatus = 'idle';
+
+function renderAgentFlow(status) {
+  if (status) lastFlowStatus = status;
+  else status = lastFlowStatus;
+  const container = $('agent-flow-svg');
+  if (!container) return;
+
+  const w = container.clientWidth || 600;
+  const h = 220;
+  const cx = w / 2;
+
+  // Node positions — horizontal pipeline
+  const nodes = [
+    { id: 'gemini',   x: cx - 200, y: 80,  r: 32, label: 'Gemini',      sub: 'PLANNER',   emoji: '\u{1F9E0}' },
+    { id: 'plan',     x: cx - 70,  y: 80,  r: 22, label: 'PLAN.md',     sub: 'CONTRACT',   emoji: '\u{1F4CB}' },
+    { id: 'claude',   x: cx + 70,  y: 80,  r: 32, label: 'Claude',      sub: 'EXECUTOR',   emoji: '\u{1F916}' },
+    { id: 'code',     x: cx + 200, y: 80,  r: 22, label: 'Code',        sub: 'WORKSPACE',  emoji: '\u{1F4C1}' },
+    { id: 'journal',  x: cx,       y: 175, r: 18, label: 'JOURNAL.md',  sub: 'MEMORY',     emoji: '\u{1F4D3}' },
+    { id: 'inbox',    x: cx - 200, y: 175, r: 18, label: 'INBOX',       sub: 'Q&A',        emoji: '\u{1F4E8}' },
+  ];
+
+  // Edge states based on autopilot status
+  const isRunning = ['in_progress', 'needs_restart'].includes(status);
+  const isGemini = status === 'waiting_for_gemini';
+  const isBlocked = status === 'blocked';
+  const isDone = ['completed', 'complete'].includes(status);
+
+  const edges = [
+    { from: 'gemini', to: 'plan',    active: isGemini,  label: 'writes' },
+    { from: 'plan',   to: 'claude',  active: isRunning, label: 'reads' },
+    { from: 'claude', to: 'code',    active: isRunning, label: 'edits' },
+    { from: 'claude', to: 'journal', active: isRunning, label: 'logs',   curved: true },
+    { from: 'claude', to: 'inbox',   active: isGemini,  label: 'asks',   curved: true, dashed: true },
+    { from: 'inbox',  to: 'gemini',  active: isGemini,  label: 'routes', dashed: true },
+  ];
+
+  // Node state classes
+  const nodeState = (id) => {
+    if (isDone) return id === 'code' ? 'complete' : 'complete';
+    if (isBlocked) return id === 'claude' ? 'blocked' : '';
+    if (isRunning && id === 'claude') return 'active';
+    if (isRunning && id === 'code') return 'active';
+    if (isGemini && id === 'gemini') return 'waiting';
+    if (isGemini && id === 'inbox') return 'waiting';
+    return '';
+  };
+
+  // SVG defs for glow filters
+  const glowDefs = `
+    <filter id="glow-blue" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-purple" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-green" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <marker id="flow-arrow" viewBox="0 -4 8 8" refX="8" refY="0" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,-4L8,0L0,4" fill="var(--border-active)"/>
+    </marker>
+    <marker id="flow-arrow-active" viewBox="0 -4 8 8" refX="8" refY="0" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,-4L8,0L0,4" fill="var(--accent)"/>
+    </marker>
+    <marker id="flow-arrow-purple" viewBox="0 -4 8 8" refX="8" refY="0" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,-4L8,0L0,4" fill="var(--purple)"/>
+    </marker>
+  `;
+
+  const nodeMap = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+  const edgeSvg = edges.map(e => {
+    const a = nodeMap[e.from], b = nodeMap[e.to];
+    const activeClass = e.active ? 'active' : '';
+    const isGeminiEdge = e.from === 'gemini' || e.to === 'gemini' || e.from === 'inbox';
+    const markerSuffix = e.active ? (isGeminiEdge ? '-purple' : '-active') : '';
+    const strokeClass = e.dashed ? 'net-edge-return' : 'net-edge';
+
+    if (e.curved) {
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const cx_ = mx + dy * 0.3, cy_ = my - dx * 0.3;
+      return `<path class="${strokeClass} ${activeClass}" d="M${a.x},${a.y + a.r} Q${cx_},${cy_} ${b.x},${b.y - b.r}"
+        marker-end="url(#flow-arrow${markerSuffix})" ${e.active && isGeminiEdge ? 'stroke="var(--purple)"' : ''}/>
+        <text class="net-edge-label" x="${cx_}" y="${cy_ - 4}">${e.label}</text>`;
+    }
+    const angle = Math.atan2(b.y - a.y, b.x - a.x);
+    const x1 = a.x + Math.cos(angle) * a.r, y1 = a.y + Math.sin(angle) * a.r;
+    const x2 = b.x - Math.cos(angle) * b.r, y2 = b.y - Math.sin(angle) * b.r;
+    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2 - 10;
+    return `<line class="${strokeClass} ${activeClass}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"
+      marker-end="url(#flow-arrow${markerSuffix})" ${e.active && isGeminiEdge ? 'stroke="var(--purple)"' : ''}/>
+      <text class="net-edge-label" x="${mx}" y="${my}">${e.label}</text>`;
+  }).join('');
+
+  const nodesSvg = nodes.map(n => {
+    const state = nodeState(n.id);
+    const isGeminiNode = n.id === 'gemini' || n.id === 'inbox';
+    const stateClass = state + (isGeminiNode && state ? ' gemini' : '');
+    const filterAttr = state === 'active' ? 'filter="url(#glow-blue)"' :
+      (state === 'waiting' ? 'filter="url(#glow-purple)"' :
+      (state === 'complete' ? 'filter="url(#glow-green)"' : ''));
+    return `<g class="flow-node" data-id="${n.id}">
+      <circle class="net-node ${stateClass}" cx="${n.x}" cy="${n.y}" r="${n.r}" ${filterAttr}/>
+      <text class="net-emoji" x="${n.x}" y="${n.y}" dy="1">${n.emoji}</text>
+      <text class="net-node-name" x="${n.x}" y="${n.y + n.r + 14}">${n.label}</text>
+      <text class="net-node-sub" x="${n.x}" y="${n.y + n.r + 26}">${n.sub}</text>
+    </g>`;
+  }).join('');
+
+  // Status banner
+  const statusColors = {
+    idle: 'var(--text-muted)', in_progress: 'var(--accent)', needs_restart: 'var(--accent)',
+    waiting_for_gemini: 'var(--purple)', blocked: 'var(--orange)',
+    completed: 'var(--green)', complete: 'var(--green)',
+  };
+  const statusLabel = {
+    idle: 'Idle', in_progress: 'Claude Executing', needs_restart: 'Restarting',
+    waiting_for_gemini: 'Gemini Answering', blocked: 'Blocked',
+    completed: 'Complete', complete: 'Complete',
+  };
+  const sColor = statusColors[status] || 'var(--text-muted)';
+  const sLabel = statusLabel[status] || status;
+  const statusSvg = `<text x="${cx}" y="${h - 2}" text-anchor="middle" fill="${sColor}" font-size="11" font-weight="600" letter-spacing="1">${sLabel.toUpperCase()}</text>`;
+
+  container.innerHTML = `<svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
+    <defs>${glowDefs}</defs>
+    ${edgeSvg}
+    ${nodesSvg}
+    ${statusSvg}
+  </svg>`;
+}
+
+// ─── Code Graph (D3 force-directed, GitNexus data) ───────────────────────────
+
+let codeGraphData = null;
+let codeGraphEnv = null;
+
+const CLUSTER_COLORS = [
+  '#4f8ef7', '#22d3a0', '#a78bfa', '#f59e0b', '#f43f5e',
+  '#06b6d4', '#fb923c', '#84cc16', '#e879f9', '#6366f1',
+  '#14b8a6', '#f472b6', '#facc15', '#38bdf8', '#ef4444',
+  '#8b5cf6', '#10b981',
+];
+
+const CLUSTER_LABELS = {};
+
+function requestCodeGraph() {
+  if (!ws || !activeProjectId) return;
+  const container = document.getElementById('code-graph-container');
+  if (container) {
+    container.innerHTML = `<div class="dimmed" style="padding:40px;text-align:center">
+      <div style="font-size:24px;margin-bottom:12px;animation:pulse 2s infinite">⚡</div>
+      <div style="font-size:14px;color:var(--text-muted)">Querying Code Graph...</div>
+    </div>`;
+  }
+  const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  setTxt('cg-nodes', '—'); setTxt('cg-edges', '—'); setTxt('cg-clusters', '—'); setTxt('cg-flows', '—');
+  ws.send(JSON.stringify({ type: 'get-graph', projectId: activeProjectId }));
+}
+window.requestCodeGraph = requestCodeGraph;
+
+function codeGraphZoomFit() {
+  if (!codeGraphEnv) { requestCodeGraph(); return; }
+  const { svg, g, zoomBehavior, width, height, nodes } = codeGraphEnv;
+  if (!nodes || nodes.length === 0) return;
+
+  // Compute bounding box of actual node positions
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  nodes.forEach(d => {
+    const r = d.size || 5;
+    if (d.x == null || d.y == null) return;
+    x0 = Math.min(x0, d.x - r);
+    y0 = Math.min(y0, d.y - r);
+    x1 = Math.max(x1, d.x + r);
+    y1 = Math.max(y1, d.y + r);
+  });
+
+  if (!isFinite(x0)) return; // nodes not positioned yet — retry after sim settles
+  const pad = 40;
+  const bw = x1 - x0 + pad * 2;
+  const bh = y1 - y0 + pad * 2;
+  const scale = Math.min(width / bw, height / bh, 2);
+  const tx = width  / 2 - scale * (x0 + bw / 2 - pad);
+  const ty = height / 2 - scale * (y0 + bh / 2 - pad);
+
+  svg.transition().duration(600).call(
+    zoomBehavior.transform,
+    d3.zoomIdentity.translate(tx, ty).scale(scale)
+  );
+}
+window.codeGraphZoomFit = codeGraphZoomFit;
+
+function renderCodeGraph(data) {
+  if (data.error) {
+    const container = $('code-graph-container');
+    if (container) container.innerHTML = `<div class="dimmed" style="padding:40px;text-align:center">
+      <div style="font-size:32px;margin-bottom:12px">\u{1F50D}</div>
+      <div style="font-size:14px;margin-bottom:8px">${data.error === 'no-index' ? 'No GitNexus index found' : 'Error loading graph'}</div>
+      <div style="font-size:12px;color:var(--text-muted)">Run <code>gitnexus analyze</code> in the project to generate the code graph</div>
+    </div>`;
+    return;
+  }
+
+  codeGraphData = data;
+  const { functions = [], callEdges = [], clusters = [], membership = [], meta = {}, processes = [] } = data;
+
+  // Update stats
+  const setTxt = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  setTxt('cg-nodes', meta.nodes || functions.length);
+  setTxt('cg-edges', meta.edges || callEdges.length);
+  setTxt('cg-clusters', meta.communities || clusters.length);
+  setTxt('cg-flows', meta.processes || processes.length);
+
+  // Build cluster membership map
+  const fnCluster = {};
+  membership.forEach(m => { fnCluster[m.fn] = m.cluster; });
+
+  // Assign cluster colors
+  clusters.forEach((c, i) => {
+    CLUSTER_LABELS[c.id] = c.label || `Cluster ${i}`;
+  });
+
+  // Build nodes
+  const fnSet = new Set(functions.map(f => f.id));
+  const nodes = functions.map(f => {
+    const cluster = fnCluster[f.id] || 'unknown';
+    const clusterIdx = clusters.findIndex(c => c.id === cluster);
+    const color = CLUSTER_COLORS[clusterIdx % CLUSTER_COLORS.length] || '#4f8ef7';
+    const isExported = f.exported === 'true';
+    const size = isExported ? 8 : 5;
+    return { id: f.id, name: f.name, file: f.file, line: f.line, cluster, color, size, exported: isExported };
+  });
+
+  // Build edges (only where both src & tgt exist)
+  const links = callEdges
+    .filter(e => fnSet.has(e.src) && fnSet.has(e.tgt))
+    .map(e => ({ source: e.src, target: e.tgt, conf: parseFloat(e.conf) || 0.5 }));
+
+  // Render legend
+  const legendEl = $('code-graph-legend');
+  if (legendEl) {
+    const uniqueClusters = [...new Set(membership.map(m => m.cluster))];
+    legendEl.innerHTML = uniqueClusters.map(cId => {
+      const idx = clusters.findIndex(c => c.id === cId);
+      const color = CLUSTER_COLORS[idx % CLUSTER_COLORS.length];
+      const label = CLUSTER_LABELS[cId] || cId;
+      const count = membership.filter(m => m.cluster === cId).length;
+      return `<span class="cg-legend-item" data-cluster="${cId}" onclick="highlightCluster('${cId}')">
+        <span class="cg-legend-dot" style="background:${color}"></span>
+        <span class="cg-legend-label">${label}</span>
+        <span class="cg-legend-count">${count}</span>
+      </span>`;
+    }).join('');
+  }
+
+  // D3 force graph
+  const container = $('code-graph-container');
+  if (!container) return;
   container.innerHTML = '';
-  
-  const width = container.clientWidth || 560;
-  const height = container.clientHeight || 250;
-  
+
+  const width = container.clientWidth || 800;
+  const height = container.clientHeight || 500;
+
   const svg = d3.select(container).append('svg')
     .attr('width', '100%')
     .attr('height', '100%')
     .attr('viewBox', [0, 0, width, height]);
-    
+
+  // Zoom
+  const g = svg.append('g');
+  const zoomBehavior = d3.zoom()
+    .scaleExtent([0.15, 4])
+    .on('zoom', (event) => g.attr('transform', event.transform));
+  svg.call(zoomBehavior);
+
+  // Arrow defs
   svg.append('defs').append('marker')
-    .attr('id', 'arrow')
-    .attr('viewBox', '0 -5 10 10')
-    .attr('refX', 20)
+    .attr('id', 'cg-arrow')
+    .attr('viewBox', '0 -3 6 6')
+    .attr('refX', 12)
     .attr('refY', 0)
-    .attr('markerWidth', 6)
-    .attr('markerHeight', 6)
+    .attr('markerWidth', 5)
+    .attr('markerHeight', 5)
     .attr('orient', 'auto')
     .append('path')
-    .attr('fill', '#4f8ef7')
-    .attr('d', 'M0,-5L10,0L0,5');
+    .attr('fill', 'var(--border-active)')
+    .attr('d', 'M0,-3L6,0L0,3');
 
-  const linkGroup = svg.append('g').attr('class', 'links');
-  const nodeGroup = svg.append('g').attr('class', 'nodes');
-
-  const simulation = d3.forceSimulation()
-    .force('link', d3.forceLink().id(d => d.id).distance(100))
-    .force('charge', d3.forceManyBody().strength(-300))
-    .force('center', d3.forceCenter(width / 2, height / 2));
-
-  return { svg, linkGroup, nodeGroup, simulation, width, height };
-}
-
-function updateAgentGraph(state) {
-  if (!d3Env) d3Env = initD3Graph('d3-container');
-  if (!d3Env) return;
-
-  const status = state.autopilot?.status || 'idle';
-  let nodes = [];
-  let links = [];
-
-  if (state.gitnexus && state.gitnexus.nodes && state.gitnexus.links) {
-    nodes = state.gitnexus.nodes;
-    links = state.gitnexus.links;
-  } else {
-    // Default fallback graph modeling the agents
-    nodes = [
-      { id: 'gemini', label: 'Gemini Planner', size: 24, color: '#904ff7', icon: '🧠' },
-      { id: 'claude', label: 'Claude Executor', size: 24, color: '#4f8ef7', icon: '🤖' },
-      { id: 'files', label: 'Workspace Files', size: 18, color: '#2a2f3a', icon: '📁' }
-    ];
-    links = [
-      { source: 'gemini', target: 'claude', label: 'PLAN.md' },
-      { source: 'claude', target: 'files', label: 'edits' },
-      { source: 'claude', target: 'gemini', label: 'JOURNAL.md' }
-    ];
-  }
-
-  const { linkGroup, nodeGroup, simulation } = d3Env;
-
-  // Render links
-  const linkSelection = linkGroup.selectAll('.link').data(links, d => d.source.id || d.source + '-' + (d.target.id || d.target));
-  linkSelection.exit().remove();
-  const linkEnter = linkSelection.enter().append('path')
-    .attr('class', 'link')
-    .attr('stroke', '#4f8ef7')
-    .attr('stroke-width', 2)
-    .attr('fill', 'none')
-    .attr('marker-end', 'url(#arrow)');
-    
-  const linkUpdate = linkEnter.merge(linkSelection);
+  // Render edges
+  const linkG = g.append('g').attr('class', 'cg-links');
+  const linkSel = linkG.selectAll('line')
+    .data(links)
+    .join('line')
+    .attr('class', 'cg-edge')
+    .attr('stroke', 'var(--border)')
+    .attr('stroke-width', d => 0.5 + d.conf)
+    .attr('stroke-opacity', 0.3)
+    .attr('marker-end', 'url(#cg-arrow)');
 
   // Render nodes
-  const nodeSelection = nodeGroup.selectAll('.node').data(nodes, d => d.id);
-  nodeSelection.exit().remove();
-  const nodeEnter = nodeSelection.enter().append('g')
-    .attr('class', 'node')
+  const nodeG = g.append('g').attr('class', 'cg-nodes');
+  const nodeSel = nodeG.selectAll('g')
+    .data(nodes)
+    .join('g')
+    .attr('class', 'cg-node-group')
     .call(d3.drag()
-        .on('start', dragstarted)
-        .on('drag', dragged)
-        .on('end', dragended));
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
 
-  nodeEnter.append('circle')
-    .attr('r', d => d.size || 20)
-    .attr('fill', d => d.color || '#333')
-    .attr('stroke', '#111')
-    .attr('stroke-width', 2)
-    .on('mouseover', function(e, d) { d3.select(this).attr('stroke', '#fff'); })
-    .on('mouseout', function(e, d) { d3.select(this).attr('stroke', '#111'); });
+  nodeSel.append('circle')
+    .attr('r', d => d.size)
+    .attr('fill', d => d.color)
+    .attr('stroke', d => d.color)
+    .attr('stroke-width', 0.5)
+    .attr('fill-opacity', 0.8)
+    .attr('class', 'cg-node-circle');
 
-  nodeEnter.append('text')
-    .attr('dy', 5)
+  // Labels for all nodes
+  nodeSel.append('text')
+    .attr('class', 'cg-node-label')
+    .attr('dy', d => d.size + 10)
     .attr('text-anchor', 'middle')
-    .attr('font-size', '16px')
-    .style('pointer-events', 'none')
-    .text(d => d.icon || '');
-    
-  nodeEnter.append('text')
-    .attr('dy', 38)
-    .attr('text-anchor', 'middle')
-    .attr('font-size', '11px')
-    .attr('fill', '#aaa')
-    .text(d => d.label || d.id);
+    .attr('fill', 'var(--text-muted)')
+    .attr('font-size', '8px')
+    .text(d => d.name);
 
-  const nodeUpdate = nodeEnter.merge(nodeSelection);
+  // Tooltips
+  nodeSel.append('title').text(d => `${d.name}\n${d.file}:${d.line}\nCluster: ${CLUSTER_LABELS[d.cluster] || d.cluster}`);
 
-  simulation.nodes(nodes).on('tick', () => {
-    linkUpdate.attr('d', d => {
-      const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
-      const dr = Math.sqrt(dx * dx + dy * dy);
-      const curve = d.label === 'JOURNAL.md' ? `A${dr},${dr} 0 0,1` : 'L';
-      return d.label === 'JOURNAL.md' 
-        ? `M${d.source.x},${d.source.y} ${curve} ${d.target.x},${d.target.y}`
-        : `M${d.source.x},${d.source.y} L${d.target.x},${d.target.y}`;
+  // Click handler for detail panel
+  nodeSel.on('click', (e, d) => {
+    e.stopPropagation();
+    showCodeGraphDetail(d, links, nodes);
+    // Highlight connected
+    const connected = new Set();
+    connected.add(d.id);
+    links.forEach(l => {
+      const sId = l.source.id || l.source;
+      const tId = l.target.id || l.target;
+      if (sId === d.id) connected.add(tId);
+      if (tId === d.id) connected.add(sId);
     });
-    nodeUpdate.attr('transform', d => `translate(${d.x},${d.y})`);
+    nodeSel.select('circle')
+      .attr('fill-opacity', n => connected.has(n.id) ? 1 : 0.15)
+      .attr('stroke-width', n => n.id === d.id ? 2 : 0.5);
+    linkSel
+      .attr('stroke-opacity', l => {
+        const sId = l.source.id || l.source;
+        const tId = l.target.id || l.target;
+        return (sId === d.id || tId === d.id) ? 0.8 : 0.05;
+      })
+      .attr('stroke', l => {
+        const sId = l.source.id || l.source;
+        const tId = l.target.id || l.target;
+        return (sId === d.id || tId === d.id) ? d.color : 'var(--border)';
+      });
   });
 
-  simulation.force('link').links(links);
-  simulation.alpha(1).restart();
-  
-  function dragstarted(event, d) {
-    if (!event.active) simulation.alphaTarget(0.3).restart();
-    d.fx = d.x; d.fy = d.y;
+  // Click background to reset
+  svg.on('click', () => {
+    nodeSel.select('circle').attr('fill-opacity', 0.8).attr('stroke-width', 0.5);
+    linkSel.attr('stroke-opacity', 0.3).attr('stroke', 'var(--border)');
+    const detail = $('code-graph-detail');
+    if (detail) detail.innerHTML = '<div class="dimmed" style="padding:12px;font-size:12px">Click a node to see details</div>';
+  });
+
+  // Simulation
+  const sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(40).strength(0.3))
+    .force('charge', d3.forceManyBody().strength(-60))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(d => d.size + 3))
+    .force('x', d3.forceX(width / 2).strength(0.05))
+    .force('y', d3.forceY(height / 2).strength(0.05))
+    .on('tick', () => {
+      linkSel
+        .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+    });
+
+  codeGraphEnv = { svg, g, sim, zoomBehavior, width, height, nodeSel, linkSel, nodes, links };
+
+  // Initial zoom to fit after settling
+  setTimeout(() => {
+    sim.alpha(0.3).restart();
+    setTimeout(codeGraphZoomFit, 1500);
+  }, 100);
+}
+
+function showCodeGraphDetail(node, links, allNodes) {
+  const detail = $('code-graph-detail');
+  if (!detail) return;
+  const callers = [], callees = [];
+  links.forEach(l => {
+    const sId = l.source.id || l.source;
+    const tId = l.target.id || l.target;
+    if (sId === node.id) callees.push(tId);
+    if (tId === node.id) callers.push(sId);
+  });
+  const nameOf = id => { const n = allNodes.find(n => n.id === id); return n ? n.name : id; };
+  detail.innerHTML = `
+    <div class="cg-detail-header">
+      <span class="cg-detail-dot" style="background:${node.color}"></span>
+      <span class="cg-detail-name">${escHtml(node.name)}</span>
+      ${node.exported ? '<span class="cg-detail-tag">exported</span>' : ''}
+    </div>
+    <div class="cg-detail-file">${escHtml(node.file)}:${node.line}</div>
+    <div class="cg-detail-cluster">Cluster: ${escHtml(CLUSTER_LABELS[node.cluster] || node.cluster)}</div>
+    ${callers.length ? `<div class="cg-detail-section"><span class="cg-detail-section-label">Called by (${callers.length})</span>${callers.map(c => `<span class="cg-detail-ref">${escHtml(nameOf(c))}</span>`).join('')}</div>` : ''}
+    ${callees.length ? `<div class="cg-detail-section"><span class="cg-detail-section-label">Calls (${callees.length})</span>${callees.map(c => `<span class="cg-detail-ref">${escHtml(nameOf(c))}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+function highlightCluster(clusterId) {
+  if (!codeGraphEnv) return;
+  const { nodeSel, linkSel, nodes, links } = codeGraphEnv;
+  const inCluster = new Set(nodes.filter(n => n.cluster === clusterId).map(n => n.id));
+  if (inCluster.size === 0) return;
+  nodeSel.select('circle')
+    .attr('fill-opacity', n => inCluster.has(n.id) ? 1 : 0.1)
+    .attr('stroke-width', n => inCluster.has(n.id) ? 2 : 0.5);
+  linkSel
+    .attr('stroke-opacity', l => {
+      const s = l.source.id || l.source, t = l.target.id || l.target;
+      return (inCluster.has(s) && inCluster.has(t)) ? 0.8 : 0.03;
+    });
+  // Show cluster detail
+  const detail = $('code-graph-detail');
+  if (detail) {
+    const fns = nodes.filter(n => n.cluster === clusterId);
+    detail.innerHTML = `
+      <div class="cg-detail-header">
+        <span class="cg-detail-dot" style="background:${fns[0]?.color || '#4f8ef7'}"></span>
+        <span class="cg-detail-name">${escHtml(CLUSTER_LABELS[clusterId] || clusterId)}</span>
+        <span class="cg-detail-tag">${fns.length} symbols</span>
+      </div>
+      <div class="cg-detail-section">${fns.map(f => `<span class="cg-detail-ref">${escHtml(f.name)}</span>`).join('')}</div>
+    `;
   }
-  function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
-  function dragended(event, d) {
-    if (!event.active) simulation.alphaTarget(0);
-    d.fx = null; d.fy = null;
-  }
+}
+window.highlightCluster = highlightCluster;
+
+// ─── Compatibility: updateAgentGraph called from renderProjectState ──────────
+
+function updateAgentGraph(state) {
+  const status = state?.autopilot?.status || 'idle';
+  renderAgentFlow(status);
 }
 
 // ─── Agent Conversation ───────────────────────────────────────────────────────
@@ -1192,13 +1619,11 @@ function fmtTime(minutes) {
 }
 
 function renderUsage(stats) {
+  // Only write time fields — count fields are owned by renderUsageTab
   const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
-  set('usage-today-sessions', stats.today?.count ?? 0);
-  set('usage-today-time',     fmtTime(stats.today?.minutes));
-  set('usage-week-sessions',  stats.week?.count ?? 0);
-  set('usage-week-time',      fmtTime(stats.week?.minutes));
-  set('usage-total-sessions', stats.total?.count ?? 0);
-  set('usage-total-time',     fmtTime(stats.total?.minutes));
+  set('usage-today-time',  fmtTime(stats.today?.minutes));
+  set('usage-week-time',   fmtTime(stats.week?.minutes));
+  set('usage-total-time',  fmtTime(stats.total?.minutes));
 
   const listEl = $('usage-session-list');
   if (!listEl) return;
@@ -1234,16 +1659,11 @@ function renderUsageTab() {
   const total    = allSessions.length;
   const complete = allSessions.filter(s => s.status === 'complete').length;
   const active   = allSessions.filter(s => ['in_progress','testing','waiting_for_gemini','awaiting_review'].includes(s.status)).length;
-  const totalTasks = allSessions.reduce((sum, s) => sum + (s.total || 0), 0);
-  const doneTasks  = allSessions.reduce((sum, s) => sum + (s.done  || 0), 0);
-
+  // Only write count fields — time fields are owned by renderUsage
   const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
   set('usage-today-sessions', active);
-  set('usage-today-time',     `${active} running`);
   set('usage-week-sessions',  complete);
-  set('usage-week-time',      `${complete} complete`);
   set('usage-total-sessions', total);
-  set('usage-total-time',     `${doneTasks}/${totalTasks} tasks`);
 
   // Per-session list
   listEl.innerHTML = allSessions.map(s => {
@@ -1268,6 +1688,23 @@ function renderUsageTab() {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function showToast(message, type = 'info') {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;';
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  const bg = type === 'error' ? '#e55' : type === 'warn' ? '#e93' : '#2a9d8f';
+  toast.style.cssText = `background:${bg};color:#fff;padding:12px 18px;border-radius:8px;font-size:13px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,0.4);cursor:pointer;`;
+  toast.textContent = message;
+  toast.onclick = () => toast.remove();
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), 6000);
+}
 
 function escHtml(str) {
   const d = document.createElement('div');

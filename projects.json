@@ -5,5 +5,13 @@
     "path": "/Users/milo/Desktop/InnoRHL/dev-team",
     "description": "The dev-team system itself",
     "createdAt": "2026-03-21T19:08:17.640Z"
+  },
+  {
+    "id": "mshkltk",
+    "name": "Mshkltk",
+    "path": "/Users/milo/Desktop/InnoRHL/projects/mshkltk",
+    "githubUrl": "https://github.com/eeemile777/mshkltk",
+    "description": "",
+    "createdAt": "2026-03-22T18:15:48.494Z"
   }
 ]

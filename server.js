@@ -22,26 +22,30 @@ import { execSync, exec, spawn } from 'child_process';
 import util from 'util';
 const execPromise = util.promisify(exec);
 
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DEV_TEAM_ROOT      = __dirname;
-const INNORHL_ROOT       = resolve(__dirname, '..'); // /Users/milo/Desktop/InnoRHL
-const PROJECTS_ROOT      = resolve(INNORHL_ROOT, 'projects'); // where cloned projects live
-const PORT               = process.env.DASHBOARD_PORT || 3001;
+const DEV_TEAM_ROOT = __dirname;
+const INNORHL_ROOT = resolve(__dirname, '..'); // /Users/milo/Desktop/InnoRHL
+const PROJECTS_ROOT = resolve(INNORHL_ROOT, 'projects'); // where cloned projects live
+const PORT = process.env.DASHBOARD_PORT || 3001;
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
 if (!DASHBOARD_PASSWORD) {
   console.error('  ❌ DASHBOARD_PASSWORD env var is required. Set it in .env');
   process.exit(1);
 }
-const PROJECTS_FILE      = resolve(DEV_TEAM_ROOT, 'projects.json');
-const PROJECTS_DATA_DIR  = resolve(DEV_TEAM_ROOT, '.projects');
-const SESSIONS_DIR       = resolve(DEV_TEAM_ROOT, 'sessions'); // legacy / dev-team's own sessions
+const PROJECTS_FILE = resolve(DEV_TEAM_ROOT, 'projects.json');
+const PROJECTS_DATA_DIR = resolve(DEV_TEAM_ROOT, '.projects');
+const SESSIONS_DIR = resolve(DEV_TEAM_ROOT, 'sessions'); // legacy / dev-team's own sessions
 
 // ─── Autopilot Constants ─────────────────────────────────────────────────────
-const AUTOPILOT_COOLDOWN_MS     = 5000;     // 5s minimum between Claude restarts
-const AUTOPILOT_MAX_RETRIES     = 10;       // max consecutive restarts without progress
-const AUTOPILOT_MAX_RUNTIME_MS  = 600000;   // 10min max per Claude run
-const activeClaudeProcesses     = new Map(); // sessionKey → { process, startTime, projectId }
-const autopilotLocks            = new Set(); // sessionKeys currently being handled
+const AUTOPILOT_COOLDOWN_MS = 5000;     // 5s minimum between Claude restarts
+const AUTOPILOT_MAX_RETRIES = 10;       // max consecutive restarts without progress
+const AUTOPILOT_MAX_RUNTIME_MS = 600000;   // 10min max per Claude run
+const activeClaudeProcesses = new Map(); // sessionKey → { process, startTime, projectId }
+const autopilotLocks = new Set(); // sessionKeys currently being handled
 
 // Ensure projects root exists
 if (!existsSync(PROJECTS_ROOT)) mkdirSync(PROJECTS_ROOT, { recursive: true });
@@ -112,7 +116,8 @@ function findGeminiPath() {
 }
 
 function slugify(name) {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
+  return slug || 'session'; // fallback if input has no alphanumeric chars
 }
 
 const GEMINI_PATH = findGeminiPath();
@@ -120,9 +125,17 @@ const GEMINI_PATH = findGeminiPath();
 // ─── Project Registry ────────────────────────────────────────────────────────
 
 if (!existsSync(PROJECTS_DATA_DIR)) mkdirSync(PROJECTS_DATA_DIR, { recursive: true });
-if (!existsSync(SESSIONS_DIR))      mkdirSync(SESSIONS_DIR, { recursive: true });
+if (!existsSync(SESSIONS_DIR)) mkdirSync(SESSIONS_DIR, { recursive: true });
+
+let _projectsCache = null;
+let _projectsCacheTime = 0;
+const PROJECTS_CACHE_TTL = 2000; // 2s TTL
 
 function loadProjects() {
+  const now = Date.now();
+  if (_projectsCache && (now - _projectsCacheTime) < PROJECTS_CACHE_TTL) {
+    return _projectsCache;
+  }
   const projects = safeJSON(PROJECTS_FILE);
   if (!projects || !Array.isArray(projects)) {
     const defaults = [{
@@ -130,12 +143,18 @@ function loadProjects() {
       description: 'The dev-team system itself', createdAt: new Date().toISOString()
     }];
     writeFileSync(PROJECTS_FILE, JSON.stringify(defaults, null, 2));
+    _projectsCache = defaults;
+    _projectsCacheTime = now;
     return defaults;
   }
+  _projectsCache = projects;
+  _projectsCacheTime = now;
   return projects;
 }
 
 function saveProjects(projects) {
+  _projectsCache = projects; // invalidate by updating cache immediately
+  _projectsCacheTime = Date.now();
   writeFileSync(PROJECTS_FILE, JSON.stringify(projects, null, 2));
 }
 
@@ -148,31 +167,31 @@ function getProjectDataDir(projectId) {
 function getProjectFiles(project) {
   if (project.id === 'innorhl') {
     return {
-      state:   resolve(DEV_TEAM_ROOT, '.autopilot-state.json'),
-      plan:    resolve(DEV_TEAM_ROOT, 'PLAN.md'),
+      state: resolve(DEV_TEAM_ROOT, '.autopilot-state.json'),
+      plan: resolve(DEV_TEAM_ROOT, 'PLAN.md'),
       journal: resolve(DEV_TEAM_ROOT, 'JOURNAL.md'),
-      bugs:    resolve(DEV_TEAM_ROOT, 'KNOWN_BUGS.md'),
+      bugs: resolve(DEV_TEAM_ROOT, 'KNOWN_BUGS.md'),
       gitnexus: resolve(DEV_TEAM_ROOT, '.gitnexus/meta.json'),
     };
   }
   const dataDir = getProjectDataDir(project.id);
   return {
-    state:   resolve(dataDir, '.autopilot-state.json'),
-    plan:    resolve(dataDir, 'PLAN.md'),
+    state: resolve(dataDir, '.autopilot-state.json'),
+    plan: resolve(dataDir, 'PLAN.md'),
     journal: resolve(dataDir, 'JOURNAL.md'),
-    bugs:    resolve(dataDir, 'KNOWN_BUGS.md'),
+    bugs: resolve(dataDir, 'KNOWN_BUGS.md'),
     gitnexus: resolve(project.path || dataDir, '.gitnexus/meta.json'),
   };
 }
 
 function getProjectState(project) {
-  const files   = getProjectFiles(project);
-  const state   = safeJSON(files.state);
-  const plan    = safeRead(files.plan);
+  const files = getProjectFiles(project);
+  const state = safeJSON(files.state);
+  const plan = safeRead(files.plan);
   const journal = safeRead(files.journal);
-  const gnMeta  = safeJSON(files.gitnexus);
-  const tasks   = parseTasks(plan);
-  const done    = tasks. filter(t => t.done).length;
+  const gnMeta = safeJSON(files.gitnexus);
+  const tasks = parseTasks(plan);
+  const done = tasks.filter(t => t.done).length;
   return {
     id: project.id, name: project.name, path: project.path, description: project.description,
     autopilot: state || { status: 'idle', remaining_tasks: 0 },
@@ -239,13 +258,39 @@ function createSessionDir(sessionId, sessionName, projectId) {
     writeFileSync(statePath, JSON.stringify({
       status: 'idle',
       session_name: sessionName,
+      total_tasks: 0,
+      completed_tasks: 0,
       remaining_tasks: 0,
-      blockers: null,
+      retry_count: 0,
+      blocker_reason: null,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }, null, 2));
   }
   return dir;
+}
+
+function createSessionWorktree(sessionId, projectId) {
+  // Create an isolated git worktree for this session so parallel sessions don't collide
+  const project = loadProjects().find(p => p.id === projectId);
+  const repoPath = project?.path || DEV_TEAM_ROOT;
+  const worktreePath = resolve(repoPath, '.worktrees', sessionId);
+  const branchName = `session/${sessionId}`;
+
+  if (existsSync(worktreePath)) return worktreePath; // already exists
+
+  try {
+    // Check if the project is a git repo
+    execSync('git rev-parse --is-inside-work-tree', { cwd: repoPath, stdio: 'pipe' });
+    mkdirSync(resolve(repoPath, '.worktrees'), { recursive: true });
+    execSync(`git worktree add "${worktreePath}" -b "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
+    console.log(`  ✅ Worktree created: ${worktreePath} (branch: ${branchName})`);
+    return worktreePath;
+  } catch (err) {
+    console.warn(`  ⚠ Could not create worktree for session ${sessionId}: ${err.message}`);
+    // Fallback: return the repo path itself (sessions share the same working dir)
+    return repoPath;
+  }
 }
 
 function listAllSessions(projectId) {
@@ -256,13 +301,13 @@ function listAllSessions(projectId) {
       .filter(d => d.isDirectory())
       .map(d => {
         const sessionId = d.name;
-        const dir   = resolve(sessionsDir, sessionId);
+        const dir = resolve(sessionsDir, sessionId);
         const state = safeJSON(resolve(dir, '.autopilot-state.json'));
-        const plan  = safeRead(resolve(dir, 'PLAN.md'));
+        const plan = safeRead(resolve(dir, 'PLAN.md'));
         const tasks = parseTasks(plan);
-        const done  = tasks.filter(t => t.done).length;
-        const journal  = safeRead(resolve(dir, 'JOURNAL.md'));
-        const entries  = parseJournalEntries(journal);
+        const done = tasks.filter(t => t.done).length;
+        const journal = safeRead(resolve(dir, 'JOURNAL.md'));
+        const entries = parseJournalEntries(journal);
         return {
           sessionId,
           name: state?.session_name || sessionId,
@@ -280,11 +325,11 @@ function listAllSessions(projectId) {
 }
 
 function getSessionState(sessionId) {
-  const dir   = getSessionDir(sessionId);
+  const dir = getSessionDir(sessionId);
   const state = safeJSON(resolve(dir, '.autopilot-state.json'));
-  const plan  = safeRead(resolve(dir, 'PLAN.md'));
+  const plan = safeRead(resolve(dir, 'PLAN.md'));
   const tasks = parseTasks(plan);
-  const done  = tasks.filter(t => t.done).length;
+  const done = tasks.filter(t => t.done).length;
   return {
     sessionId,
     name: state?.session_name || sessionId,
@@ -305,7 +350,7 @@ function loadUsageData(projectId) {
 }
 
 function saveUsageData(projectId, data) {
-  try { writeFileSync(getUsageFile(projectId), JSON.stringify(data, null, 2)); } catch {}
+  try { writeFileSync(getUsageFile(projectId), JSON.stringify(data, null, 2)); } catch { }
 }
 
 function recordSessionStart(projectId) {
@@ -326,19 +371,19 @@ function recordSessionEnd(projectId, projectName, endStatus) {
 }
 
 function getUsageStats(projectId) {
-  const data    = loadUsageData(projectId);
+  const data = loadUsageData(projectId);
   const sessions = data.sessions || [];
   const now = new Date();
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const weekStart  = new Date(todayStart);
+  const weekStart = new Date(todayStart);
   weekStart.setDate(weekStart.getDate() - 7);
-  const todaySess  = sessions.filter(s => new Date(s.start) >= todayStart);
-  const weekSess   = sessions.filter(s => new Date(s.start) >= weekStart);
+  const todaySess = sessions.filter(s => new Date(s.start) >= todayStart);
+  const weekSess = sessions.filter(s => new Date(s.start) >= weekStart);
   const sum = (arr) => arr.reduce((a, b) => a + (b.durationMin || 0), 0);
   return {
     today: { count: todaySess.length, minutes: sum(todaySess) },
-    week:  { count: weekSess.length,  minutes: sum(weekSess) },
-    total: { count: sessions.length,  minutes: sum(sessions) },
+    week: { count: weekSess.length, minutes: sum(weekSess) },
+    total: { count: sessions.length, minutes: sum(sessions) },
     recent: sessions.slice(-30).reverse(),
   };
 }
@@ -349,19 +394,19 @@ function parseAgentConversationFromFiles(planContent, journalContent) {
   const messages = [];
 
   if (planContent) {
-    const titleMatch   = planContent.match(/^# Plan: (.+)/m);
-    const title        = titleMatch ? titleMatch[1].trim() : 'Active Plan';
+    const titleMatch = planContent.match(/^# Plan: (.+)/m);
+    const title = titleMatch ? titleMatch[1].trim() : 'Active Plan';
     const contextMatch = planContent.match(/## Context\n([\s\S]*?)(?=\n##)/);
-    const archMatch    = planContent.match(/## Architecture Decisions\n([\s\S]*?)(?=\n##|$)/);
+    const archMatch = planContent.match(/## Architecture Decisions\n([\s\S]*?)(?=\n##|$)/);
     const tasksSection = planContent.split('## Tasks')[1];
-    const tasksOnly    = tasksSection ? tasksSection.split('##')[0] : '';
-    const totalTasks   = (tasksOnly.match(/^- \[[ x]\]/gm) || []).length;
-    const doneTasks    = (tasksOnly.match(/^- \[x\]/gm) || []).length;
+    const tasksOnly = tasksSection ? tasksSection.split('##')[0] : '';
+    const totalTasks = (tasksOnly.match(/^- \[[ x]\]/gm) || []).length;
+    const doneTasks = (tasksOnly.match(/^- \[x\]/gm) || []).length;
 
     messages.push({
       agent: 'gemini', type: 'plan', title,
-      context:      contextMatch ? contextMatch[1].trim().slice(0, 500) : null,
-      architecture: archMatch    ? archMatch[1].trim().slice(0, 400) : null,
+      context: contextMatch ? contextMatch[1].trim().slice(0, 500) : null,
+      architecture: archMatch ? archMatch[1].trim().slice(0, 400) : null,
       totalTasks, doneTasks,
     });
 
@@ -380,9 +425,9 @@ function parseAgentConversationFromFiles(planContent, journalContent) {
     let m;
     while ((m = sessionRegex.exec(journalContent)) !== null) {
       const date = m[1].trim();
-      const raw  = m[2].trim();
+      const raw = m[2].trim();
       const statusMatch = raw.match(/\*\*Status\*\*:\s*(.+)/);
-      const tasksMatch  = raw.match(/\*\*Tasks completed\*\*:\s*(.+)/);
+      const tasksMatch = raw.match(/\*\*Tasks completed\*\*:\s*(.+)/);
       const body = raw.replace(/\*\*[^*]+\*\*:.+\n?/g, '').trim();
       messages.push({
         agent: 'claude', type: 'session-report', date,
@@ -403,7 +448,7 @@ function parseAgentConversation(project) {
 
 function parseSessionConversation(sessionId) {
   const dir = getSessionDir(sessionId);
-  const plan    = safeRead(resolve(dir, 'PLAN.md'));
+  const plan = safeRead(resolve(dir, 'PLAN.md'));
   const journal = safeRead(resolve(dir, 'JOURNAL.md'));
   return parseAgentConversationFromFiles(plan, journal);
 }
@@ -420,7 +465,7 @@ function addActivity(projectId, projectName, level, text) {
   const msg = JSON.stringify({ type: 'activity', ...entry });
   for (const [ws, client] of clients) {
     if (client.authenticated && ws.readyState === ws.OPEN) {
-      try { ws.send(msg); } catch {}
+      try { ws.send(msg); } catch { }
     }
   }
 }
@@ -442,9 +487,8 @@ const CLAUDE_PATH = findClaudePath();
 
 function getAutopilotDir(sessionId, projectId) {
   if (sessionId) return getSessionDir(sessionId, projectId);
-  const projects = loadProjects();
-  const project = projects.find(p => p.id === projectId);
-  return project?.path || DEV_TEAM_ROOT;
+  if (projectId === 'innorhl' || !projectId) return DEV_TEAM_ROOT;
+  return getProjectDataDir(projectId); // use .projects/{id}/ consistent with getProjectFiles
 }
 
 function handleAutopilotStateChange(sessionId, projectId) {
@@ -463,7 +507,9 @@ function handleAutopilotStateChange(sessionId, projectId) {
       break;
 
     case 'waiting_for_gemini':
-      feedGeminiQuestion(sessionId, projectId, dir);
+      feedGeminiQuestion(sessionId, projectId, dir).catch(err =>
+        addActivity(projectId || 'innorhl', projectId || 'innorhl', 'error', `feedGeminiQuestion uncaught: ${err.message}`)
+      );
       break;
 
     case 'completed':
@@ -496,8 +542,13 @@ function scheduleClaudeRestart(sessionId, projectId, state, dir) {
   const lastExit = state.last_claude_exit ? new Date(state.last_claude_exit).getTime() : 0;
   const elapsed = Date.now() - lastExit;
   if (elapsed < AUTOPILOT_COOLDOWN_MS) {
-    setTimeout(() => scheduleClaudeRestart(sessionId, projectId, state, dir),
-      AUTOPILOT_COOLDOWN_MS - elapsed);
+    setTimeout(() => {
+      // Re-read state from disk — it may have changed during cooldown
+      const freshState = safeJSON(resolve(dir, '.autopilot-state.json'));
+      if (freshState?.status === 'needs_restart') {
+        scheduleClaudeRestart(sessionId, projectId, freshState, dir);
+      }
+    }, AUTOPILOT_COOLDOWN_MS - elapsed);
     return;
   }
 
@@ -520,8 +571,25 @@ function scheduleClaudeRestart(sessionId, projectId, state, dir) {
     updated_at: new Date().toISOString(),
   }, null, 2));
 
-  const projectPath = dir;
-  const env = { ...process.env, SESSION_ID: sessionId || '', PROJECT_DIR: projectPath };
+  // Resolve the project's actual CODE directory (where Claude edits files)
+  // This is distinct from `dir` (the autopilot data dir where PLAN.md etc. live)
+  // For sessions: use the worktree if it exists (isolated code copy)
+  // For non-session: use the project's code path directly
+  const projectCodePath = (() => {
+    const proj = loadProjects().find(p => p.id === projectId);
+    const repoPath = proj?.path || dir;
+    if (sessionId) {
+      const worktreePath = resolve(repoPath, '.worktrees', sessionId);
+      if (existsSync(worktreePath)) return worktreePath;
+    }
+    return repoPath;
+  })();
+  const env = {
+    ...process.env,
+    SESSION_ID: sessionId || '',
+    PROJECT_DIR: projectCodePath,
+    AUTOPILOT_DIR: dir, // where PLAN.md, .autopilot-state.json, JOURNAL.md live
+  };
 
   addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
     `Autopilot spawning Claude Code${sessionId ? ` (session: ${sessionId})` : ''} — ${state.remaining_tasks || '?'} tasks left`);
@@ -530,7 +598,7 @@ function scheduleClaudeRestart(sessionId, projectId, state, dir) {
     '--print',
     '--dangerously-skip-permissions',
     'Read PLAN.md and execute the next unchecked task. Follow the CLAUDE.md startup checklist.',
-  ], { cwd: projectPath, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  ], { cwd: projectCodePath, env, stdio: ['pipe', 'pipe', 'pipe'] });
 
   activeClaudeProcesses.set(key, { process: claudeProcess, startTime: Date.now(), projectId });
 
@@ -575,7 +643,7 @@ function scheduleClaudeRestart(sessionId, projectId, state, dir) {
   claudeProcess.on('exit', () => {
     if (outputBuffer.trim()) {
       const outputPath = resolve(dir, '.last-claude-output.txt');
-      try { writeFileSync(outputPath, outputBuffer); } catch {}
+      try { writeFileSync(outputPath, outputBuffer); } catch { }
     }
   });
 }
@@ -584,10 +652,10 @@ async function feedGeminiQuestion(sessionId, projectId, dir) {
   const key = sessionId || projectId;
   autopilotLocks.add(key);
 
-  const inboxPath  = resolve(dir, 'GEMINI_INBOX.md');
+  const inboxPath = resolve(dir, 'GEMINI_INBOX.md');
   const answerPath = resolve(dir, 'CLAUDE_INBOX.md');
-  const planPath   = resolve(dir, 'PLAN.md');
-  const statePath  = resolve(dir, '.autopilot-state.json');
+  const planPath = resolve(dir, 'PLAN.md');
+  const statePath = resolve(dir, '.autopilot-state.json');
 
   if (!existsSync(inboxPath)) {
     writeFileSync(statePath, JSON.stringify({
@@ -627,25 +695,27 @@ async function feedGeminiQuestion(sessionId, projectId, dir) {
     `Feeding Gemini Claude's question${sessionId ? ` (session: ${sessionId})` : ''}`);
 
   try {
-    const { stdout } = await execPromise(
-      `${GEMINI_PATH} -p ${JSON.stringify(prompt)}`,
-      { cwd: dir, timeout: 120000 }
-    );
+    const { stdout } = await new Promise((resolve, reject) => {
+      let out = '', err = '';
+      const proc = spawn(GEMINI_PATH, ['-p', prompt], { cwd: dir, timeout: 120000 });
+      proc.stdout?.on('data', d => out += d);
+      proc.stderr?.on('data', d => err += d);
+      proc.on('exit', code => code === 0 ? resolve({ stdout: out }) : reject(new Error(err || `gemini failed (${code})`)));
+      proc.on('error', reject);
+    });
 
     writeFileSync(answerPath, `## Gemini's Answer\n\n${stdout}\n`);
 
     // Set state to needs_restart → triggers Claude restart via watcher
     const state = safeJSON(statePath) || {};
-    writeFileSync(statePath, JSON.stringify({
-      ...state,
-      status: 'needs_restart',
-      updated_at: new Date().toISOString(),
-    }, null, 2));
+    autopilotLocks.delete(key); // release before writing — watcher fires after write
+    writeFileSync(statePath, JSON.stringify({ ...state, status: 'needs_restart', updated_at: new Date().toISOString() }, null, 2));
 
     addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
       `Gemini answered — Claude will restart${sessionId ? ` (session: ${sessionId})` : ''}`);
 
   } catch (err) {
+    autopilotLocks.delete(key);
     writeFileSync(statePath, JSON.stringify({
       status: 'blocked',
       blocker_reason: `Gemini failed: ${err.message}`,
@@ -654,8 +724,6 @@ async function feedGeminiQuestion(sessionId, projectId, dir) {
     addActivity(projectId || 'innorhl', projectId || 'innorhl', 'error',
       `Gemini failed: ${err.message.slice(0, 200)}`);
   }
-
-  autopilotLocks.delete(key);
 }
 
 // ─── Express + WebSocket ─────────────────────────────────────────────────────
@@ -664,7 +732,7 @@ const app = express();
 app.use(express.json());
 app.use(express.static(resolve(__dirname, 'public')));
 const server = createServer(app);
-const wss    = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server });
 
 const clients = new Map(); // ws → { authenticated, activeProject, geminiSessions: Map }
 
@@ -672,7 +740,7 @@ function broadcastToProject(projectId, data) {
   const msg = JSON.stringify(data);
   for (const [ws, client] of clients) {
     if (client.authenticated && client.activeProject === projectId && ws.readyState === ws.OPEN) {
-      try { ws.send(msg); } catch {}
+      try { ws.send(msg); } catch { }
     }
   }
 }
@@ -681,7 +749,7 @@ function broadcastAll(data) {
   const msg = JSON.stringify(data);
   for (const [ws, client] of clients) {
     if (client.authenticated && ws.readyState === ws.OPEN) {
-      try { ws.send(msg); } catch {}
+      try { ws.send(msg); } catch { }
     }
   }
 }
@@ -689,12 +757,17 @@ function broadcastAll(data) {
 function sendOverview(ws) {
   const projects = loadProjects();
   const overview = projects.map(p => getProjectState(p));
-  ws.send(JSON.stringify({ type: 'overview', projects: overview }));
+  ws.send(JSON.stringify({
+    type: 'overview',
+    projects: overview,
+    gemini_available: !!GEMINI_PATH,
+    claude_available: !!CLAUDE_PATH,
+  }));
 }
 
 function sendProjectState(ws, projectId) {
   const projects = loadProjects();
-  const project  = projects.find(p => p.id === projectId);
+  const project = projects.find(p => p.id === projectId);
   if (!project) return;
   ws.send(JSON.stringify({ type: 'project-state', ...getProjectState(project) }));
 }
@@ -760,7 +833,13 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'info', text: `Cloning ${githubUrl}…` }));
           try {
             mkdirSync(projectPath, { recursive: true });
-            await execPromise(`git clone "${githubUrl}" "${projectPath}"`, { timeout: 120000 });
+            await new Promise((resolve, reject) => {
+              const proc = spawn('git', ['clone', '--', githubUrl, projectPath], { timeout: 120000 });
+              let stderr = '';
+              proc.stderr?.on('data', d => stderr += d);
+              proc.on('exit', code => code === 0 ? resolve() : reject(new Error(stderr || `git clone failed (code ${code})`)));
+              proc.on('error', reject);
+            });
             ws.send(JSON.stringify({ type: 'info', text: 'Clone complete. Injecting dev-team template…' }));
           } catch (err) {
             ws.send(JSON.stringify({ type: 'error', text: `Git clone failed: ${err.message}` }));
@@ -768,6 +847,12 @@ wss.on('connection', (ws) => {
           }
         } else if (localPath) {
           projectPath = resolve(localPath);
+          // Prevent path traversal — must be under home dir or common safe roots
+          const homeDir = process.env.HOME || '/Users';
+          if (!projectPath.startsWith(homeDir) && !projectPath.startsWith('/tmp')) {
+            ws.send(JSON.stringify({ type: 'error', text: `Path not allowed: ${projectPath}` }));
+            break;
+          }
           if (!existsSync(projectPath)) {
             ws.send(JSON.stringify({ type: 'error', text: `Path does not exist: ${projectPath}` }));
             break;
@@ -793,13 +878,63 @@ wss.on('connection', (ws) => {
         setupProjectWatcher(newProject);
         addActivity(id, newProject.name, 'info', githubUrl ? `Project cloned from ${githubUrl}` : 'Project added to dashboard');
         sendOverview(ws);
+
+        // Auto-run gitnexus analyze in the background so the Code Graph is ready
+        {
+          const analyzeId = id;
+          const analyzeName = newProject.name;
+          const analyzePath = projectPath;
+          addActivity(analyzeId, analyzeName, 'info', '🔍 Starting gitnexus analyze — building Code Graph...');
+          const gn = spawn('gitnexus', ['analyze', analyzePath], {
+            cwd: analyzePath,
+            env: { ...process.env },
+          });
+          let gnOut = '';
+          gn.stdout?.on('data', d => { gnOut += d.toString(); });
+          gn.stderr?.on('data', d => { gnOut += d.toString(); });
+          gn.on('exit', (code) => {
+            if (code === 0) {
+              addActivity(analyzeId, analyzeName, 'info', '✅ Code Graph ready! Open the Agents → Code Graph tab.');
+            } else {
+              addActivity(analyzeId, analyzeName, 'warn', `⚠️ gitnexus analyze finished with code ${code}. Check Log tab for details.`);
+            }
+          });
+          gn.on('error', (err) => {
+            addActivity(analyzeId, analyzeName, 'warn', `⚠️ Could not run gitnexus: ${err.message}`);
+          });
+        }
+        break;
+      }
+
+      case 'analyze-project': {
+        const targetId = msg.projectId || client.activeProject;
+        if (!targetId) break;
+        const projects = loadProjects();
+        const proj = projects.find(p => p.id === targetId);
+        if (!proj) break;
+        const analyzePath = proj.path;
+        addActivity(targetId, proj.name, 'info', '🔍 Starting gitnexus analyze — building Code Graph...');
+        const gn = spawn('gitnexus', ['analyze', analyzePath], {
+          cwd: analyzePath, env: { ...process.env },
+        });
+        gn.on('exit', (code) => {
+          if (code === 0) {
+            addActivity(targetId, proj.name, 'info', '✅ Code Graph ready! Switch to Agents → Code Graph tab.');
+          } else {
+            addActivity(targetId, proj.name, 'warn', `⚠️ gitnexus analyze exited with code ${code}.`);
+          }
+        });
+        gn.on('error', (err) => {
+          addActivity(targetId, proj.name, 'warn', `⚠️ Could not run gitnexus: ${err.message}`);
+        });
+        ws.send(JSON.stringify({ type: 'info', text: 'Code Graph analysis started — watch the Log tab.' }));
         break;
       }
 
       case 'refresh-template': {
         // Refresh template symlinks for one project (or all if no projectId)
         const projects = loadProjects();
-        const targets  = msg.projectId
+        const targets = msg.projectId
           ? projects.filter(p => p.id === msg.projectId)
           : projects.filter(p => p.path && existsSync(p.path));
         let count = 0;
@@ -822,18 +957,76 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      // ── Autopilot control ────────────────────────────────────────────────
+
+      case 'start-autopilot': {
+        const projectId = msg.projectId || client.activeProject || 'innorhl';
+        const sessionId = msg.sessionId || null;
+        const dir = getAutopilotDir(sessionId, projectId);
+        const statePath = resolve(dir, '.autopilot-state.json');
+        const planPath = resolve(dir, 'PLAN.md');
+
+        // Validate PLAN.md has tasks
+        let taskCount = 0;
+        if (existsSync(planPath)) {
+          const plan = readFileSync(planPath, 'utf8');
+          const tasksSection = plan.split('## Tasks')[1];
+          if (tasksSection) {
+            const tasksOnly = tasksSection.split('##')[0];
+            taskCount = tasksOnly.split('\n').filter(l => /^- \[[ x]\]/.test(l)).length;
+          }
+        }
+        if (taskCount === 0) {
+          ws.send(JSON.stringify({ type: 'error', text: 'Cannot start autopilot — PLAN.md has no tasks. Write a plan first.' }));
+          break;
+        }
+
+        // Count unchecked tasks
+        const plan = readFileSync(planPath, 'utf8');
+        const tasksSection = plan.split('## Tasks')[1];
+        const tasksOnly = tasksSection.split('##')[0];
+        const lines = tasksOnly.split('\n').filter(l => /^- \[[ x]\]/.test(l));
+        const done = lines.filter(l => l.startsWith('- [x]')).length;
+        const remaining = lines.length - done;
+
+        if (remaining === 0) {
+          ws.send(JSON.stringify({ type: 'error', text: 'All tasks are already complete. Nothing to execute.' }));
+          break;
+        }
+
+        // Write in_progress state to trigger the autopilot loop
+        const state = safeJSON(statePath) || {};
+        writeFileSync(statePath, JSON.stringify({
+          ...state,
+          status: 'in_progress',
+          total_tasks: lines.length,
+          completed_tasks: done,
+          remaining_tasks: remaining,
+          retry_count: 0,
+          blocker_reason: null,
+          created_at: state.created_at || new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }, null, 2));
+
+        addActivity(projectId, projectId, 'info',
+          `Autopilot started${sessionId ? ` (session: ${sessionId})` : ''} — ${remaining} tasks to execute`);
+        ws.send(JSON.stringify({ type: 'autopilot-started', projectId, sessionId }));
+        // The file watcher will detect the state change and call handleAutopilotStateChange
+        break;
+      }
+
       // ── Session management ─────────────────────────────────────────────────
 
       case 'create-session': {
         const projectId = client.activeProject || 'innorhl';
-        const name      = (msg.name || 'New Session').trim().slice(0, 50);
+        const name = (msg.name || 'New Session').trim().slice(0, 50);
         const sessionId = slugify(name) + '-' + Date.now().toString(36).slice(-4);
         createSessionDir(sessionId, name, projectId);
+        createSessionWorktree(sessionId, projectId);
         setupSessionFileWatcher(sessionId, projectId);
         addActivity(projectId, projectId, 'info', `Session created: ${name}`);
         sendSessionList(ws, projectId);
-        // No auto-start: Gemini starts when the user opens the session modal
-        ws.send(JSON.stringify({ type: 'session-created', sessionId, name }));
+        broadcastAll({ type: 'session-created', sessionId, name });
         break;
       }
 
@@ -843,12 +1036,18 @@ wss.on('connection', (ws) => {
         if (!sessionId) break;
         const sess = client.geminiSessions.get(sessionId);
         if (sess?.ptyProcess) {
-          try { sess.ptyProcess.kill(); } catch {}
+          try { sess.ptyProcess.kill(); } catch { }
         }
         client.geminiSessions.delete(sessionId);
         if (client.ptyBuffers) client.ptyBuffers.delete(sessionId);
         sessionProjectMap.delete(sessionId);
-        ws.send(JSON.stringify({ type: 'session-closed', sessionId }));
+        // Clean up file watcher
+        const sessionWatcher = sessionFileWatchers.get(sessionId);
+        if (sessionWatcher) {
+          sessionWatcher.close();
+          sessionFileWatchers.delete(sessionId);
+        }
+        broadcastAll({ type: 'session-closed', sessionId });
         addActivity(projectId, projectId, 'info', `Session closed: ${sess?.name || sessionId}`);
         sendSessionList(ws, projectId);
         break;
@@ -867,7 +1066,7 @@ wss.on('connection', (ws) => {
           const mcpPath = resolve(project.path || DEV_TEAM_ROOT, '.mcp.json');
           // Mask secret values in .env before sending to browser
           const rawEnv = existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '';
-          const envContent = rawEnv.replace(/^([A-Z_]+=)(.+)$/gm, (_, key, val) => {
+          const envContent = rawEnv.replace(/^([A-Za-z_][A-Za-z0-9_]*=)(.+)$/gm, (_, key, val) => {
             const safeKeys = ['NODE_ENV', 'PORT', 'DASHBOARD_PORT', 'PROJECT_ROOT', 'NEXTAUTH_URL'];
             const keyName = key.replace('=', '');
             return safeKeys.includes(keyName) ? key + val : key + '••••••••';
@@ -885,7 +1084,15 @@ wss.on('connection', (ws) => {
         if (project) {
           // Only allow saving MCP config via dashboard — .env must be edited manually
           const mcpPath = resolve(project.path || DEV_TEAM_ROOT, '.mcp.json');
-          if (mcp != null) writeFileSync(mcpPath, mcp, 'utf-8');
+          if (mcp != null) {
+            try {
+              JSON.parse(mcp); // validate before writing
+              writeFileSync(mcpPath, mcp, 'utf-8');
+            } catch (e) {
+              ws.send(JSON.stringify({ type: 'error', text: `Invalid JSON in MCP config: ${e.message}` }));
+              break;
+            }
+          }
           ws.send(JSON.stringify({ type: 'settings-saved', projectId }));
         }
         break;
@@ -903,19 +1110,43 @@ wss.on('connection', (ws) => {
       case 'merge-session': {
         const { sessionId } = msg;
         if (!sessionId) break;
+        const mergeProjectId = client.activeProject || 'innorhl';
         try {
-          const worktreePath = resolve(DEV_TEAM_ROOT, '.worktrees', sessionId);
-          const branchName   = `session/${sessionId}`;
-          if (existsSync(worktreePath)) {
-            await execPromise(`git checkout main && git merge ${branchName} --no-edit`, {
-              cwd: resolve(DEV_TEAM_ROOT, '..')
-            });
-            await execPromise(`git worktree remove "${worktreePath}" --force`, {
-              cwd: resolve(DEV_TEAM_ROOT, '..')
-            });
-            addActivity(client.activeProject || 'innorhl', 'innorhl', 'info', `Session "${sessionId}" merged to main`);
-            ws.send(JSON.stringify({ type: 'merge-success', sessionId }));
+          const mergeProject = loadProjects().find(p => p.id === mergeProjectId);
+          const repoCwd = mergeProject?.path || DEV_TEAM_ROOT;
+          const worktreePath = resolve(repoCwd, '.worktrees', sessionId);
+          const branchName = `session/${sessionId}`;
+          if (!existsSync(worktreePath)) {
+            ws.send(JSON.stringify({ type: 'error', text: `No worktree found for session "${sessionId}". Nothing to merge.` }));
+            break;
           }
+          // Detect default branch
+          const defaultBranch = await new Promise((done) => {
+            let out = '';
+            const p = spawn('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: repoCwd });
+            p.stdout?.on('data', d => out += d);
+            p.on('exit', () => done(out.trim() || 'main'));
+            p.on('error', () => done('main'));
+          });
+          await new Promise((done, reject) => {
+            const p = spawn('git', ['checkout', defaultBranch], { cwd: repoCwd });
+            p.on('exit', code => code === 0 ? done() : reject(new Error(`git checkout ${defaultBranch} failed`)));
+            p.on('error', reject);
+          });
+          await new Promise((done, reject) => {
+            let stderr = '';
+            const p = spawn('git', ['merge', '--no-edit', branchName], { cwd: repoCwd });
+            p.stderr?.on('data', d => stderr += d);
+            p.on('exit', code => code === 0 ? done() : reject(new Error(stderr || `git merge ${branchName} failed`)));
+            p.on('error', reject);
+          });
+          await new Promise((done, reject) => {
+            const p = spawn('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoCwd });
+            p.on('exit', code => code === 0 ? done() : reject(new Error('worktree remove failed')));
+            p.on('error', reject);
+          });
+          addActivity(mergeProjectId, mergeProject?.name || mergeProjectId, 'info', `Session "${sessionId}" merged to ${defaultBranch}`);
+          ws.send(JSON.stringify({ type: 'merge-success', sessionId }));
         } catch (e) {
           ws.send(JSON.stringify({ type: 'error', text: `Merge failed: ${e.message}` }));
         }
@@ -926,11 +1157,11 @@ wss.on('connection', (ws) => {
 
       case 'start-gemini': {
         const sessionId = msg.sessionId;
-        const force     = msg.force !== false; // default true unless explicitly false
+        const force = msg.force !== false; // default true unless explicitly false
         if (sessionId) {
-          const dir   = getSessionDir(sessionId);
+          const dir = getSessionDir(sessionId);
           const state = safeJSON(resolve(dir, '.autopilot-state.json'));
-          const name  = state?.session_name || sessionId;
+          const name = state?.session_name || sessionId;
           startGeminiSession(ws, client, sessionId, name, force);
         } else {
           // Legacy: single session called 'default'
@@ -956,7 +1187,9 @@ wss.on('connection', (ws) => {
       // ── Other actions ─────────────────────────────────────────────────────
 
       case 'action':
-        handleAction(msg.action, msg.projectId || client.activeProject, ws);
+        handleAction(msg.action, msg.projectId || client.activeProject, ws).catch(err =>
+          ws.send(JSON.stringify({ type: 'error', text: `Action failed: ${err.message}` }))
+        );
         break;
 
       case 'get-overview':
@@ -982,6 +1215,71 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'get-graph': {
+        const targetId = msg.projectId || client.activeProject;
+        if (!targetId) break;
+        const proj = loadProjects().find(p => p.id === targetId);
+        const projectPath = proj?.path || DEV_TEAM_ROOT;
+        const gnMeta = safeJSON(resolve(projectPath, '.gitnexus/meta.json'));
+        if (!gnMeta) {
+          ws.send(JSON.stringify({ type: 'graph-data', projectId: targetId, error: 'no-index' }));
+          break;
+        }
+        // Use --repo flag so gitnexus knows which of multiple indexed repos to query
+        const repoArg = `--repo ${JSON.stringify(projectPath)}`;
+        const NODE_LIMIT = 1000000000; // cap for readable visualization
+
+        try {
+          const cypher = (q) => {
+            const result = execSync(`gitnexus cypher ${repoArg} ${JSON.stringify(q)}`, {
+              cwd: projectPath, timeout: 15000, maxBuffer: 32 * 1024 * 1024,
+              stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            return JSON.parse(result.toString());
+          };
+          const parseTable = (md) => {
+            if (!md) return [];
+            const lines = md.trim().split('\n');
+            if (lines.length < 3) return [];
+            const headers = lines[0].split('|').slice(1, -1).map(h => h.trim());
+            return lines.slice(2).map(line => {
+              const vals = line.split('|').slice(1, -1).map(v => v.trim());
+              const row = {};
+              headers.forEach((h, i) => row[h] = vals[i]);
+              return row;
+            });
+          };
+
+          // Fetch: exported functions first (most important), then fill up to NODE_LIMIT
+          const fnExported = parseTable(cypher(
+            `MATCH (n:Function) WHERE n.isExported = 'true' RETURN n.id AS id, n.name AS name, n.filePath AS file, n.startLine AS line, n.isExported AS exported LIMIT ${NODE_LIMIT}`
+          ).markdown);
+          const remaining = NODE_LIMIT - fnExported.length;
+          const fnOther = remaining > 0 ? parseTable(cypher(
+            `MATCH (n:Function) WHERE n.isExported <> 'true' RETURN n.id AS id, n.name AS name, n.filePath AS file, n.startLine AS line, n.isExported AS exported LIMIT ${remaining}`
+          ).markdown) : [];
+          const functions = [...fnExported, ...fnOther];
+
+          const fnIds = new Set(functions.map(f => f.id));
+
+          // Fetch clusters, edges, membership only for nodes we have
+          const clusters = parseTable(cypher(`MATCH (c:Community) RETURN c.id AS id, c.label AS label, c.symbolCount AS size, c.cohesion AS cohesion LIMIT 50`).markdown);
+          const allEdges = parseTable(cypher(`MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b:Function) WHERE a.isExported = 'true' OR b.isExported = 'true' RETURN a.id AS src, b.id AS tgt, r.confidence AS conf LIMIT 500`).markdown);
+          const callEdges = allEdges.filter(e => fnIds.has(e.src) && fnIds.has(e.tgt));
+          const membership = parseTable(cypher(`MATCH (f:Function)-[:CodeRelation]->(c:Community) RETURN f.id AS fn, c.id AS cluster LIMIT ${NODE_LIMIT}`).markdown);
+          const processes = parseTable(cypher(`MATCH (p:Process) RETURN p.id AS id, p.label AS label, p.processType AS type, p.stepCount AS steps, p.entryPointId AS entry LIMIT 50`).markdown);
+
+          ws.send(JSON.stringify({
+            type: 'graph-data', projectId: targetId,
+            meta: { ...gnMeta.stats, sampled: functions.length < (gnMeta.stats?.nodes || 0) },
+            functions, clusters, callEdges, membership, processes,
+          }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'graph-data', projectId: targetId, error: err.message }));
+        }
+        break;
+      }
+
       case 'get-usage': {
         const targetId = msg.projectId || client.activeProject;
         if (targetId) {
@@ -997,7 +1295,7 @@ wss.on('connection', (ws) => {
     // Kill all Gemini sessions for this client
     for (const [sessionId, sess] of client.geminiSessions) {
       if (sess?.ptyProcess) {
-        try { sess.ptyProcess.kill(); } catch {}
+        try { sess.ptyProcess.kill(); } catch { }
       }
     }
     clients.delete(ws);
@@ -1031,7 +1329,7 @@ function startGeminiSession(ws, client, sessionId, sessionName, force = true) {
     // Force restart: kill existing PTY and clear buffer
     const existing = client.geminiSessions.get(sessionId);
     if (existing?.ptyProcess) {
-      try { existing.ptyProcess.kill(); } catch {}
+      try { existing.ptyProcess.kill(); } catch { }
     }
     client.ptyBuffers.delete(sessionId);
   }
@@ -1044,7 +1342,7 @@ function startGeminiSession(ws, client, sessionId, sessionName, force = true) {
     let state = 'booting';
     let responseBuffer = '';
 
-    const spawnCmd  = process.platform === 'darwin' ? process.execPath : GEMINI_PATH;
+    const spawnCmd = process.platform === 'darwin' ? process.execPath : GEMINI_PATH;
     const spawnArgs = process.platform === 'darwin' ? ['--no-warnings=DEP0040', GEMINI_PATH] : [];
 
     const ptyProcess = pty.spawn(spawnCmd, spawnArgs, {
@@ -1098,7 +1396,7 @@ function startGeminiSession(ws, client, sessionId, sessionName, force = true) {
 
 async function handleAction(action, projectId, ws) {
   const projects = loadProjects();
-  const project  = projects.find(p => p.id === projectId);
+  const project = projects.find(p => p.id === projectId);
   if (!project) return;
   const files = getProjectFiles(project);
 
@@ -1112,12 +1410,14 @@ async function handleAction(action, projectId, ws) {
       break;
     }
     case 'resume': {
-      const state    = safeJSON(files.state) || {};
+      const state = safeJSON(files.state) || {};
       const remaining = state.remaining_tasks || 0;
       writeFileSync(files.state, JSON.stringify(
-        { ...state, status: remaining > 0 ? 'needs_restart' : 'idle',
+        {
+          ...state, status: remaining > 0 ? 'needs_restart' : 'idle',
           retry_count: 0, blocker_reason: null,
-          updated_at: new Date().toISOString() }, null, 2
+          updated_at: new Date().toISOString()
+        }, null, 2
       ));
       addActivity(projectId, project.name, 'info', 'Autopilot RESUMED');
       break;
@@ -1126,8 +1426,10 @@ async function handleAction(action, projectId, ws) {
       try {
         await execPromise('git reset --hard HEAD~1', { cwd: project.path });
         addActivity(projectId, project.name, 'warn', 'Rolled back to previous git snapshot');
+        ws.send(JSON.stringify({ type: 'info', text: 'Rollback complete.' }));
       } catch (e) {
         addActivity(projectId, project.name, 'error', `Rollback failed: ${e.message}`);
+        ws.send(JSON.stringify({ type: 'error', text: `Rollback failed: ${e.message}` }));
       }
       break;
     }
@@ -1149,21 +1451,22 @@ const TEMPLATE_DIR = resolve(INNORHL_ROOT, 'core-template');
 
 // Items that become SYMLINKS in the project (dynamic — always in sync with template)
 const TEMPLATE_SYMLINKS = [
-  { name: 'CLAUDE.md',            isDir: false },
-  { name: 'GEMINI.md',            isDir: false },
-  { name: '.mcp.json',            isDir: false },
+  { name: 'CLAUDE.md', isDir: false },
+  { name: 'GEMINI.md', isDir: false },
+  { name: '.mcp.json', isDir: false },
   { name: '.claude/settings.json', isDir: false },
-  { name: '.agents',              isDir: true  },
-  { name: '.claude/agents',       isDir: true  },
-  { name: '.claude/skills',       isDir: true  },
+  { name: '.agents', isDir: true },
+  { name: '.claude/agents', isDir: true },
+  { name: '.claude/skills', isDir: true },
 ];
 
 // Items that are COPIED once (project-specific, can be modified)
 const TEMPLATE_COPIES = [
-  { name: '.env.example',         dest: '.env.example' },
-  { name: 'JOURNAL.md',           dest: 'JOURNAL.md'   },
-  { name: 'KNOWN_BUGS.md',        dest: 'KNOWN_BUGS.md' },
-  { name: '.gitignore.template',  dest: '.gitignore'    },
+  { name: '.env.example', dest: '.env.example' },
+  { name: 'JOURNAL.md', dest: 'JOURNAL.md' },
+  { name: 'KNOWN_BUGS.md', dest: 'KNOWN_BUGS.md' },
+  { name: '.gitignore.template', dest: '.gitignore' },
+  { name: 'PLAN.md.template', dest: 'PLAN.md.template' },
 ];
 
 function makeSymlink(src, dest) {
@@ -1186,17 +1489,29 @@ function injectProjectTemplate(projectPath) {
 
     // 1. Create symlinks for dynamic template files/dirs
     for (const item of TEMPLATE_SYMLINKS) {
-      const src  = resolve(TEMPLATE_DIR, item.name);
+      const src = resolve(TEMPLATE_DIR, item.name);
       const dest = resolve(projectPath, item.name);
       if (existsSync(src)) makeSymlink(src, dest);
     }
 
     // 2. Copy starter files (project-specific, not symlinked)
     for (const item of TEMPLATE_COPIES) {
-      const src  = resolve(TEMPLATE_DIR, item.name);
+      const src = resolve(TEMPLATE_DIR, item.name);
       const dest = resolve(projectPath, item.dest);
-      if (existsSync(src) && !existsSync(dest)) {
-        mkdirSync(resolve(dest, '..'), { recursive: true });
+      if (!existsSync(src)) continue;
+      mkdirSync(resolve(dest, '..'), { recursive: true });
+
+      if (item.dest === '.gitignore' && existsSync(dest)) {
+        // Merge: append missing entries from template .gitignore into existing one
+        const templateLines = readFileSync(src, 'utf8').split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        const existingContent = readFileSync(dest, 'utf8');
+        const existingLines = new Set(existingContent.split('\n').map(l => l.trim()));
+        const missing = templateLines.filter(l => !existingLines.has(l));
+        if (missing.length > 0) {
+          const append = '\n\n# ── InnoRHL dev-team (auto-added) ──\n' + missing.join('\n') + '\n';
+          writeFileSync(dest, existingContent.trimEnd() + append);
+        }
+      } else if (!existsSync(dest)) {
         copyFileSync(src, dest);
       }
     }
@@ -1215,7 +1530,7 @@ function injectProjectTemplate(projectPath) {
 function refreshProjectTemplate(projectPath) {
   try {
     for (const item of TEMPLATE_SYMLINKS) {
-      const src  = resolve(TEMPLATE_DIR, item.name);
+      const src = resolve(TEMPLATE_DIR, item.name);
       const dest = resolve(projectPath, item.name);
       if (!existsSync(src)) continue;
       // Remove old symlink if it exists, re-create it
@@ -1246,7 +1561,7 @@ function setupProjectWatcher(project) {
     const label = Object.entries(files).find(([, v]) => v === changedPath)?.[0] || 'file';
 
     if (changedPath === files.state) {
-      const newState  = safeJSON(files.state);
+      const newState = safeJSON(files.state);
       const newStatus = newState?.status;
       if (stateTracker.prevStatus !== 'in_progress' && newStatus === 'in_progress') {
         recordSessionStart(project.id);
@@ -1309,10 +1624,10 @@ function setupSessionFileWatcher(sessionId, projectId) {
 
     // Broadcast updated session state to all clients
     const state = getSessionState(sessionId);
-    const msg   = JSON.stringify({ type: 'session-state', ...state });
+    const msg = JSON.stringify({ type: 'session-state', ...state });
     for (const [ws, client] of clients) {
       if (client.authenticated && ws.readyState === ws.OPEN) {
-        try { ws.send(msg); } catch {}
+        try { ws.send(msg); } catch { }
       }
     }
   });
@@ -1327,7 +1642,7 @@ function initSessionWatchers() {
     readdirSync(SESSIONS_DIR, { withFileTypes: true })
       .filter(d => d.isDirectory())
       .forEach(d => setupSessionFileWatcher(d.name));
-  } catch {}
+  } catch { }
 }
 
 // ─── Stale session recovery ──────────────────────────────────────────────────
@@ -1383,21 +1698,40 @@ server.listen(PORT, () => {
   console.log(`  Projects   : ${projects.length}`);
   projects.forEach(p => console.log(`    - ${p.name} (${p.path})`));
   console.log(`  Sessions   : ${listAllSessions().length} active`);
-  console.log(`  ─────────────────────\n`);
+  console.log(`  ─────────────────────`);
+
+  // Show install instructions for missing CLIs
+  if (!CLAUDE_PATH) {
+    console.log(`\n  ⚠ Claude CLI not found. Autopilot cannot execute plans.`);
+    console.log(`    Install: npm install -g @anthropic-ai/claude-code`);
+    console.log(`    Docs:    https://docs.anthropic.com/en/docs/claude-code`);
+  }
+  if (!GEMINI_PATH) {
+    console.log(`\n  ⚠ Gemini CLI not found. Autopilot Q&A with Gemini disabled.`);
+    console.log(`    Install: brew install gemini-cli`);
+    console.log(`    Alt:     npm install -g @anthropic-ai/gemini-cli`);
+    console.log(`    Docs:    https://github.com/anthropics/gemini-cli`);
+  }
+  if (CLAUDE_PATH && GEMINI_PATH) {
+    console.log(`\n  ✅ All CLIs ready. Dashboard fully operational.`);
+  }
+  console.log('');
 });
 
 process.on('SIGINT', () => {
   // Kill all active Claude autopilot processes
   for (const [, entry] of activeClaudeProcesses) {
-    if (entry.process) { try { entry.process.kill(); } catch {} }
+    if (entry.process) { try { entry.process.kill(); } catch { } }
   }
   for (const [, w] of projectWatchers) w.close();
   for (const [, w] of sessionFileWatchers) w.close();
   for (const [, client] of clients) {
     for (const [, sess] of client.geminiSessions) {
-      if (sess?.ptyProcess) { try { sess.ptyProcess.kill(); } catch {} }
+      if (sess?.ptyProcess) { try { sess.ptyProcess.kill(); } catch { } }
     }
   }
   server.close();
   process.exit(0);
 });
+
+process.on('SIGTERM', () => process.emit('SIGINT'));

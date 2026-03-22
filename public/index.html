@@ -1,16 +1,19 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
   <title>InnoRHL Control Room</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%234f8ef7'/><circle cx='16' cy='16' r='6' fill='%230a0f1e'/></svg>" />
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23FF781F'/><circle cx='16' cy='16' r='6' fill='%23000000'/></svg>" />
   <link rel="stylesheet" href="style.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script src="https://d3js.org/d3.v7.min.js"></script>
 </head>
+
 <body>
 
   <!-- Login -->
@@ -18,7 +21,7 @@
     <div class="login-box">
       <div class="logo"><span class="logo-dot">&#9679;</span> InnoRHL</div>
       <p class="login-sub">Control Room</p>
-      <input id="password-input" type="password" placeholder="Password" autocomplete="current-password" />
+      <input id="password-input" type="password" placeholder="Password" autocomplete="current-password" aria-label="Dashboard password" />
       <button id="login-btn">Enter</button>
       <p id="login-error" class="error hidden">Wrong password</p>
     </div>
@@ -28,7 +31,7 @@
   <div id="app" class="hidden">
 
     <!-- Sidebar -->
-    <aside id="sidebar">
+    <aside id="sidebar" role="navigation">
       <div class="sidebar-header">
         <span class="logo-sm"><span class="logo-dot">&#9679;</span> InnoRHL</span>
       </div>
@@ -39,7 +42,10 @@
       </div>
       <div class="sidebar-section">
         <div class="sidebar-label">TEMPLATE</div>
-        <button class="sidebar-template-btn" id="btn-refresh-template" title="Re-apply symlinks to all projects" onclick="refreshAllTemplates()">↺ Refresh All Projects</button>
+        <button class="sidebar-template-btn" id="btn-refresh-template" title="Re-apply symlinks to all projects"
+          onclick="refreshAllTemplates()">↺ Refresh All Projects</button>
+        <button class="sidebar-template-btn" id="btn-analyze-project" title="Build / Rebuild Code Graph for current project"
+          onclick="analyzeCurrentProject()">⚡ Build Code Graph</button>
       </div>
       <div class="sidebar-section sidebar-bottom">
         <button class="sidebar-nav-btn active" data-view="project" id="nav-project">Project</button>
@@ -65,20 +71,21 @@
 
         <!-- Tab bar -->
         <nav id="tabs">
-          <button class="tab active" data-tab="status">Status</button>
-          <button class="tab" data-tab="agents">Agents</button>
-          <button class="tab" data-tab="chat">Sessions <span id="sessions-count-badge" class="sessions-count-badge"></span></button>
-          <button class="tab" data-tab="tasks">Tasks</button>
-          <button class="tab" data-tab="log">Log</button>
-          <button class="tab" data-tab="usage">Usage</button>
-          <button class="tab" data-tab="settings">Settings</button>
+          <button class="tab active" data-tab="status" role="tab" aria-selected="true">Status</button>
+          <button class="tab" data-tab="agents" role="tab" aria-selected="false">Agents</button>
+          <button class="tab" data-tab="chat" role="tab" aria-selected="false">Sessions <span id="sessions-count-badge"
+              class="sessions-count-badge"></span></button>
+          <button class="tab" data-tab="tasks" role="tab" aria-selected="false">Tasks</button>
+          <button class="tab" data-tab="log" role="tab" aria-selected="false">Log</button>
+          <button class="tab" data-tab="usage" role="tab" aria-selected="false">Usage</button>
+          <button class="tab" data-tab="settings" role="tab" aria-selected="false">Settings</button>
         </nav>
 
         <!-- Tab panels -->
         <div class="tab-panels">
 
           <!-- STATUS TAB -->
-          <div class="tab-panel active" id="panel-status">
+          <div class="tab-panel active" id="panel-status" role="tabpanel">
 
             <!-- Hero state card -->
             <div class="status-hero" id="status-hero">
@@ -90,16 +97,20 @@
                 </div>
               </div>
               <div class="status-actions">
+                <button class="btn-sm" id="btn-start-autopilot" onclick="startAutopilot()" title="Start autopilot — Claude begins executing the plan">▶ Start</button>
                 <button class="btn-sm" id="btn-pause" onclick="doAction('pause')">Pause</button>
                 <button class="btn-sm primary" id="btn-resume" onclick="doAction('resume')">Resume</button>
-                <button class="btn-sm danger" onclick="if(confirm('Rollback to previous git snapshot?')) doAction('rollback')">Rollback</button>
+                <button class="btn-sm danger"
+                  onclick="if(confirm('Rollback to previous git snapshot?')) doAction('rollback')">Rollback</button>
               </div>
             </div>
 
             <!-- Progress -->
             <div class="card">
               <div class="card-label">Progress</div>
-              <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+              <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill"></div>
+              </div>
               <div class="progress-text">
                 <span class="progress-nums"><span id="tasks-done">0</span> / <span id="tasks-total">0</span></span>
                 &nbsp;tasks complete
@@ -107,7 +118,7 @@
             </div>
 
             <!-- Plan + Journal side by side on desktop -->
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+            <div class="plan-journal-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
               <div class="card">
                 <div class="card-label">Current Plan</div>
                 <div id="plan-context" class="card-content dimmed">No active plan</div>
@@ -127,32 +138,60 @@
           </div>
 
           <!-- AGENTS TAB -->
-          <div class="tab-panel" id="panel-agents">
+          <div class="tab-panel" id="panel-agents" role="tabpanel">
 
-            <!-- Session selector for Agents tab -->
-            <div class="agents-session-bar">
-              <span class="card-label" style="margin:0">Session:</span>
-              <select id="agents-session-select" class="agents-session-select" onchange="onAgentsSessionChange()">
-                <option value="">— Project (root) —</option>
-              </select>
+            <!-- Sub-nav: Agent Flow | Code Graph -->
+            <div class="agents-subnav">
+              <div class="agents-subnav-left">
+                <button class="agents-subtab active" data-subtab="flow" onclick="switchAgentsSubtab('flow')">Agent Flow</button>
+                <button class="agents-subtab" data-subtab="code-graph" onclick="switchAgentsSubtab('code-graph')">Code Graph</button>
+              </div>
+              <div class="agents-subnav-right">
+                <span class="card-label" style="margin:0;font-size:11px">Session:</span>
+                <select id="agents-session-select" class="agents-session-select" onchange="onAgentsSessionChange()">
+                  <option value="">— Project (root) —</option>
+                </select>
+              </div>
             </div>
 
-            <!-- Agent Network Graph -->
-            <div class="agent-network-wrap">
-              <div class="card-label">Agent Network</div>
-              <div id="d3-container" style="width: 100%; height: 250px;"></div>
+            <!-- SUB-PANEL: Agent Flow -->
+            <div class="agents-subpanel active" id="subpanel-flow">
+              <div class="agent-flow-container">
+                <div id="agent-flow-svg" class="agent-flow-svg"></div>
+              </div>
+              <div class="card-label" style="margin-top:16px">Agent Conversation</div>
+              <div class="agent-conversation" id="agent-conversation">
+                <div class="dimmed" style="padding:12px">Select a project to load conversation</div>
+              </div>
             </div>
 
-            <!-- Agent Conversation Thread -->
-            <div class="card-label" style="margin-top:16px">Agent Conversation</div>
-            <div class="agent-conversation" id="agent-conversation">
-              <div class="dimmed" style="padding:12px">Select a project to load conversation</div>
+            <!-- SUB-PANEL: Code Graph -->
+            <div class="agents-subpanel" id="subpanel-code-graph">
+              <div class="code-graph-toolbar">
+                <div class="code-graph-stats" id="code-graph-stats">
+                  <span class="cg-stat"><span class="cg-stat-num" id="cg-nodes">—</span> symbols</span>
+                  <span class="cg-stat"><span class="cg-stat-num" id="cg-edges">—</span> calls</span>
+                  <span class="cg-stat"><span class="cg-stat-num" id="cg-clusters">—</span> clusters</span>
+                  <span class="cg-stat"><span class="cg-stat-num" id="cg-flows">—</span> flows</span>
+                </div>
+                <div class="code-graph-controls">
+                  <button class="btn-xs" id="cg-btn-zoom-fit" onclick="codeGraphZoomFit()" title="Fit to view">Fit</button>
+                  <button class="btn-xs" id="cg-btn-reload" onclick="requestCodeGraph()" title="Reload graph data">Reload</button>
+                </div>
+              </div>
+              <div class="code-graph-wrap">
+                <div id="code-graph-container" class="code-graph-container"></div>
+              </div>
+              <div class="code-graph-legend" id="code-graph-legend"></div>
+              <div class="code-graph-detail" id="code-graph-detail">
+                <div class="dimmed" style="padding:12px;font-size:12px">Click a node to see details</div>
+              </div>
             </div>
 
           </div>
 
           <!-- SESSIONS TAB -->
-          <div class="tab-panel" id="panel-chat">
+          <div class="tab-panel" id="panel-chat" role="tabpanel">
             <div class="sessions-page-header">
               <div class="sessions-page-title">
                 <span>Sessions</span>
@@ -164,50 +203,58 @@
               <div class="sessions-empty-state" id="sessions-empty-state">
                 <div class="empty-icon">🚀</div>
                 <div class="empty-title">No sessions yet</div>
-                <div class="empty-sub">Open a session to chat with Gemini — it will plan a feature, then Claude executes it automatically.</div>
+                <div class="empty-sub">Open a session to chat with Gemini — it will plan a feature, then Claude executes
+                  it automatically.</div>
                 <button class="btn-sm primary" onclick="promptNewSession()">+ New Session</button>
               </div>
             </div>
           </div>
 
           <!-- TASKS TAB -->
-          <div class="tab-panel" id="panel-tasks">
+          <div class="tab-panel" id="panel-tasks" role="tabpanel">
             <div id="task-list" class="task-list">
               <div class="dimmed">No tasks loaded</div>
             </div>
           </div>
 
           <!-- LOG TAB -->
-          <div class="tab-panel" id="panel-log">
+          <div class="tab-panel" id="panel-log" role="tabpanel">
             <div id="log-output" class="log-output">
               <div class="log-entry dimmed">Waiting for events...</div>
             </div>
           </div>
 
           <!-- SETTINGS TAB -->
-          <div class="tab-panel" id="panel-settings">
+          <div class="tab-panel" id="panel-settings" role="tabpanel">
             <div style="max-width:800px">
               <div class="card-label" style="display:flex;justify-content:space-between;align-items:flex-end;">
                 <span>Environment Variables (.env)</span>
                 <span style="font-size:11px;color:var(--text-dim);font-weight:normal">Project root level</span>
               </div>
-              <textarea id="settings-env" class="modal-input-field" style="height:150px; font-family:var(--font-mono); font-size:12px; line-height:1.4; padding:10px; white-space:pre; margin-bottom:20px; width:100%; border:1px solid var(--border); border-radius:6px; background:var(--bg);" placeholder="API_KEY=your_key_here"></textarea>
+              <textarea id="settings-env" class="modal-input-field"
+                style="height:150px; font-family:var(--font-mono); font-size:12px; line-height:1.4; padding:10px; white-space:pre; margin-bottom:20px; width:100%; border:1px solid var(--border); border-radius:6px; background:var(--bg);"
+                placeholder="API_KEY=your_key_here"></textarea>
 
               <div class="card-label" style="display:flex;justify-content:space-between;align-items:flex-end;">
                 <span>MCP Tools Configuration (.mcp.json)</span>
                 <span style="font-size:11px;color:var(--text-dim);font-weight:normal">Project root level</span>
               </div>
-              <textarea id="settings-mcp" class="modal-input-field" style="height:250px; font-family:var(--font-mono); font-size:12px; line-height:1.4; padding:10px; white-space:pre; width:100%; border:1px solid var(--border); border-radius:6px; background:var(--bg);" placeholder='{\n  "mcpServers": {}\n}'></textarea>
+              <textarea id="settings-mcp" class="modal-input-field"
+                style="height:250px; font-family:var(--font-mono); font-size:12px; line-height:1.4; padding:10px; white-space:pre; width:100%; border:1px solid var(--border); border-radius:6px; background:var(--bg);"
+                placeholder='{\n  "mcpServers": {}\n}'></textarea>
 
-              <div style="margin-top: 16px; display: flex; align-items: center; gap: 12px; background:var(--bg-card); padding:12px; border-radius:6px; border:1px solid var(--border)">
+              <div
+                style="margin-top: 16px; display: flex; align-items: center; gap: 12px; background:var(--bg-card); padding:12px; border-radius:6px; border:1px solid var(--border)">
                 <button class="btn-sm primary" onclick="saveProjectSettings()">Save Settings</button>
-                <span id="settings-status-msg" style="color: var(--green); font-size: 13px; opacity: 0; transition: opacity 0.3s">Saved successfully!</span>
+                <span id="settings-status-msg"
+                  style="color: var(--green); font-size: 13px; opacity: 0; transition: opacity 0.3s">Saved
+                  successfully!</span>
               </div>
             </div>
           </div>
 
           <!-- USAGE TAB -->
-          <div class="tab-panel" id="panel-usage">
+          <div class="tab-panel" id="panel-usage" role="tabpanel">
 
             <div class="usage-stats-row">
               <div class="usage-stat-card">
@@ -232,7 +279,8 @@
 
             <div class="subscription-banner">
               <span>💳</span>
-              <span>Running on <strong>Claude Pro</strong> + <strong>Gemini Pro</strong> subscriptions — sessions tracked, no API limits</span>
+              <span>Running on <strong>Claude Pro</strong> + <strong>Gemini Pro</strong> subscriptions — sessions
+                tracked, no API limits</span>
             </div>
 
             <div class="card-label" style="margin-top:16px;margin-bottom:8px">Session History</div>
@@ -249,7 +297,7 @@
       <div id="view-activity" class="view">
         <header>
           <div class="header-left">
-            <button class="hamburger" id="hamburger2" onclick="toggleSidebar()">&#9776;</button>
+            <button class="hamburger" id="hamburger2">&#9776;</button>
             <span class="header-title">Activity Feed</span>
           </div>
         </header>
@@ -261,7 +309,7 @@
     </main>
 
     <!-- Session Detail Modal -->
-    <div id="session-modal-overlay" class="session-modal-overlay hidden">
+    <div id="session-modal-overlay" class="session-modal-overlay hidden" role="dialog" aria-modal="true">
       <div class="session-modal">
         <div class="session-modal-header">
           <div class="session-modal-title-row">
@@ -271,6 +319,7 @@
           </div>
           <div class="session-modal-actions">
             <span id="modal-session-id-label" class="modal-session-id"></span>
+            <button class="btn-xs" id="btn-execute-plan" onclick="executeSessionPlan()" title="Start Claude executing the session plan">▶ Execute Plan</button>
             <button class="btn-xs" id="modal-restart-btn" onclick="restartModalGemini()">↺ Restart Gemini</button>
             <button class="btn-xs danger" onclick="closeSessionModal()">✕ Close</button>
           </div>
@@ -279,7 +328,8 @@
           <div class="session-modal-terminal-col">
             <div id="modal-terminal-canvas" class="modal-terminal-canvas"></div>
             <div class="modal-input-bar">
-              <textarea id="modal-input" class="modal-input-field" placeholder="Type message → Enter to send to Gemini…" rows="1"></textarea>
+              <textarea id="modal-input" class="modal-input-field" placeholder="Type message → Enter to send to Gemini…"
+                rows="1"></textarea>
               <button class="modal-send-btn" onclick="sendModalInput()">↵</button>
             </div>
           </div>
@@ -298,10 +348,11 @@
     </div>
 
     <!-- Create Session Modal -->
-    <div id="create-session-modal" class="modal-overlay hidden">
+    <div id="create-session-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
       <div class="modal">
         <div class="modal-title">New Session</div>
-        <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Name this feature or task — e.g. "Auth Redesign", "Payment Flow"</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Name this feature or task — e.g. "Auth
+          Redesign", "Payment Flow"</p>
         <input id="create-session-name" type="text" placeholder='Session name…' class="modal-input" maxlength="60"
           onkeydown="if(event.key==='Enter')confirmNewSession();if(event.key==='Escape')cancelNewSession()" />
         <div class="modal-actions">
@@ -312,13 +363,16 @@
     </div>
 
     <!-- Add Project Modal -->
-    <div id="modal-overlay" class="modal-overlay hidden">
+    <div id="modal-overlay" class="modal-overlay hidden" role="dialog" aria-modal="true">
       <div class="modal">
         <div class="modal-title">Add Project</div>
-        <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">The dev team template (CLAUDE.md, skills, MCP tools) is injected automatically.</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">The dev team template (CLAUDE.md, skills, MCP
+          tools) is injected automatically.</p>
         <input id="new-project-name" type="text" placeholder="Project name (e.g. My App)" class="modal-input" />
-        <input id="new-project-github" type="text" placeholder="GitHub URL — https://github.com/you/repo (optional)" class="modal-input" />
-        <input id="new-project-path" type="text" placeholder="Or local path — /Users/you/projects/app (if already cloned)" class="modal-input" />
+        <input id="new-project-github" type="text" placeholder="GitHub URL — https://github.com/you/repo (optional)"
+          class="modal-input" />
+        <input id="new-project-path" type="text"
+          placeholder="Or local path — /Users/you/projects/app (if already cloned)" class="modal-input" />
         <input id="new-project-desc" type="text" placeholder="Short description (optional)" class="modal-input" />
         <div class="modal-actions">
           <button class="btn-sm" onclick="closeModal()">Cancel</button>
@@ -331,4 +385,5 @@
 
   <script src="app.js"></script>
 </body>
+
 </html>
