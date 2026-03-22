@@ -13,8 +13,13 @@ node_modules/
 *.pem
 secrets/
 
-# ── Autopilot ────────────────────────────────────────────
+# ── Autopilot / Runtime State ─────────────────────────────
 .autopilot.lock
+.autopilot-state.json
+sessions/
+.projects/
+.worktrees/
+gemini_help.txt
 
 # ── GitNexus ─────────────────────────────────────────────
 .gitnexus/
