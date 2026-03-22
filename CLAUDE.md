@@ -12,6 +12,8 @@ This project is indexed by GitNexus as **dev-team** (148 symbols, 496 relationsh
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+- **Swarm - Global Locking**: Before editing any code, you MUST write a JSON array of file paths you intend to touch to `.autopilot-locks.json` in your session root.
+- **Swarm - Watercooler**: When you finish a major component or API endpoint, you MUST append a brief summary and its GitNexus symbol name to the `WATERCOOLER.md` file in the project root so other parallel sessions can use it.
 
 ## When Debugging
 

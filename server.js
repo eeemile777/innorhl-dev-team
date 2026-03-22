@@ -15,12 +15,24 @@ import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import chokidar from 'chokidar';
 import pty from 'node-pty-prebuilt-multiarch';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, unlinkSync, realpathSync } from 'fs';
 import { resolve, dirname, join, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync, exec, spawn } from 'child_process';
 import util from 'util';
 const execPromise = util.promisify(exec);
+
+// Use gitnexus LocalBackend API directly to avoid 64KB pipe truncation from CLI
+let _gnBackend = null;
+async function getGitNexusBackend() {
+  if (!_gnBackend) {
+    const gnBin = execSync('which gitnexus').toString().trim();
+    const pkgRoot = resolve(dirname(realpathSync(gnBin)), '../..');
+    const { LocalBackend } = await import(resolve(pkgRoot, 'dist/mcp/local/local-backend.js'));
+    _gnBackend = new LocalBackend();
+  }
+  return _gnBackend;
+}
 
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection:', reason);
@@ -46,6 +58,7 @@ const AUTOPILOT_MAX_RETRIES = 10;       // max consecutive restarts without prog
 const AUTOPILOT_MAX_RUNTIME_MS = 600000;   // 10min max per Claude run
 const activeClaudeProcesses = new Map(); // sessionKey → { process, startTime, projectId }
 const autopilotLocks = new Set(); // sessionKeys currently being handled
+const activeFileLocks = new Map(); // filePath → sessionId
 
 // Ensure projects root exists
 if (!existsSync(PROJECTS_ROOT)) mkdirSync(PROJECTS_ROOT, { recursive: true });
@@ -503,6 +516,7 @@ function handleAutopilotStateChange(sessionId, projectId) {
 
   switch (state.status) {
     case 'needs_restart':
+    case 'waiting_for_locks':
       scheduleClaudeRestart(sessionId, projectId, state, dir);
       break;
 
@@ -591,6 +605,32 @@ function scheduleClaudeRestart(sessionId, projectId, state, dir) {
     AUTOPILOT_DIR: dir, // where PLAN.md, .autopilot-state.json, JOURNAL.md live
   };
 
+  // Lock acquisition
+  const lockFilePath = resolve(dir, '.autopilot-locks.json');
+  let requestedLocks = [];
+  if (existsSync(lockFilePath)) {
+    try {
+      requestedLocks = JSON.parse(readFileSync(lockFilePath, 'utf8'));
+    } catch (err) {
+      console.warn(`  ⚠ Could not parse ${lockFilePath}: ${err.message}`);
+    }
+  }
+
+  if (requestedLocks.length > 0) {
+    const conflicts = requestedLocks.filter(f => activeFileLocks.has(f) && activeFileLocks.get(f) !== key);
+    if (conflicts.length > 0) {
+      console.log(`  🔒 Session ${key} waiting for locks: ${conflicts.join(', ')}`);
+      writeFileSync(resolve(dir, '.autopilot-state.json'), JSON.stringify({
+        ...state, status: 'waiting_for_locks',
+        updated_at: new Date().toISOString(),
+      }, null, 2));
+      return; // Wait for locks
+    }
+    // Acquire locks
+    requestedLocks.forEach(f => activeFileLocks.set(f, key));
+    broadcastLocks();
+  }
+
   addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
     `Autopilot spawning Claude Code${sessionId ? ` (session: ${sessionId})` : ''} — ${state.remaining_tasks || '?'} tasks left`);
 
@@ -619,13 +659,37 @@ function scheduleClaudeRestart(sessionId, projectId, state, dir) {
     activeClaudeProcesses.delete(key);
     autopilotLocks.delete(key);
 
+    // Release locks
+    let locksReleased = false;
+    for (const [file, owner] of activeFileLocks.entries()) {
+      if (owner === key) {
+        activeFileLocks.delete(file);
+        locksReleased = true;
+      }
+    }
+    if (locksReleased) broadcastLocks();
+
     addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
       `Claude exited (code ${code})${sessionId ? ` — session: ${sessionId}` : ''}`);
     broadcastAll({ type: 'autopilot-status', projectId, sessionId, status: 'stopped', exitCode: code });
 
-    // The Stop hook (on-claude-stop.js) will write the next state,
-    // which triggers the file watcher, which calls handleAutopilotStateChange again.
-    // The loop continues automatically.
+    // Re-evaluate any sessions stuck in waiting_for_locks
+    if (locksReleased) {
+      process.nextTick(() => {
+        const projects = loadProjects();
+        projects.forEach(p => {
+          listAllSessions(p.id).forEach(s => {
+            if (s.status === 'waiting_for_locks') {
+              handleAutopilotStateChange(s.sessionId, p.id);
+            }
+          });
+          const projectState = getProjectState(p);
+          if (projectState.autopilot?.status === 'waiting_for_locks') {
+            handleAutopilotStateChange(null, p.id);
+          }
+        });
+      });
+    }
   });
 
   // Capture stdout/stderr for activity log
@@ -752,6 +816,10 @@ function broadcastAll(data) {
       try { ws.send(msg); } catch { }
     }
   }
+}
+
+function broadcastLocks() {
+  broadcastAll({ type: 'locks-updated', locks: Object.fromEntries(activeFileLocks) });
 }
 
 function sendOverview(ws) {
@@ -954,6 +1022,82 @@ wss.on('connection', (ws) => {
         teardownProjectWatcher(msg.projectId);
         addActivity(msg.projectId, removed.name, 'warn', 'Project removed from dashboard');
         sendOverview(ws);
+        break;
+      }
+
+      case 'plan-epic': {
+        const { prompt } = msg;
+        const projectId = client.activeProject || 'innorhl';
+        const project = loadProjects().find(p => p.id === projectId);
+        const repoPath = project?.path || DEV_TEAM_ROOT;
+
+        if (!GEMINI_PATH) {
+          ws.send(JSON.stringify({ type: 'error', text: 'Gemini CLI not found — epic planning disabled.' }));
+          break;
+        }
+
+        addActivity(projectId, projectId, 'info', `🚀 Splitting Epic: "${prompt.slice(0, 100)}..."`);
+        ws.send(JSON.stringify({ type: 'info', text: 'Gemini is architecting the swarm tracks...' }));
+
+        const systemPrompt = `You are the Swarm Architect. Split this massive requirement into 2-4 distinct, non-overlapping sub-projects (tracks).
+Output a STRICT JSON array of objects: [{"title": "Frontend", "tasks": ["Task 1", "Task 2"]}, {"title": "Database", "tasks": ["Task A"]}].
+No markdown, no talk. Pure JSON.`;
+
+        try {
+          const { stdout } = await new Promise((resolve, reject) => {
+            let out = '', err = '';
+            const proc = spawn(GEMINI_PATH, ['-p', `${systemPrompt}\n\nRequirement: ${prompt}`], { cwd: repoPath, timeout: 120000 });
+            proc.stdout?.on('data', d => out += d);
+            proc.stderr?.on('data', d => err += d);
+            proc.on('exit', code => code === 0 ? resolve({ stdout: out }) : reject(new Error(err || `gemini failed (${code})`)));
+            proc.on('error', reject);
+          });
+
+          // Extract JSON from potential markdown blocks if Gemini got chatty
+          let jsonText = stripAnsi(stdout).trim();
+          if (jsonText.includes('```json')) jsonText = jsonText.split('```json')[1].split('```')[0].trim();
+          else if (jsonText.includes('```')) jsonText = jsonText.split('```')[1].split('```')[0].trim();
+
+          const tracks = JSON.parse(jsonText);
+          if (!Array.isArray(tracks)) throw new Error('Gemini did not return a JSON array.');
+
+          for (const track of tracks) {
+            const trackId = slugify(track.title) + '-' + Date.now().toString(36).slice(-4);
+            const sessionDir = createSessionDir(trackId, track.title, projectId);
+            createSessionWorktree(trackId, projectId);
+            
+            // Write tasks to PLAN.md
+            const planPath = resolve(sessionDir, 'PLAN.md');
+            const planContent = `# Plan: ${track.title}
+## Context
+Part of epic: ${prompt.slice(0, 200)}
+
+## Tasks
+${track.tasks.map(t => `- [ ] ${t}`).join('\n')}
+`;
+            writeFileSync(planPath, planContent);
+            
+            // Wake up the session
+            const statePath = resolve(sessionDir, '.autopilot-state.json');
+            const state = safeJSON(statePath) || {};
+            writeFileSync(statePath, JSON.stringify({
+              ...state,
+              status: 'needs_restart',
+              total_tasks: track.tasks.length,
+              remaining_tasks: track.tasks.length,
+              updated_at: new Date().toISOString(),
+            }, null, 2));
+
+            addActivity(projectId, projectId, 'info', `🐝 Spawned swarm track: ${track.title} (ID: ${trackId})`);
+          }
+
+          sendSessionList(ws, projectId);
+          ws.send(JSON.stringify({ type: 'info', text: `Epic split into ${tracks.length} tracks. Swarm is active.` }));
+
+        } catch (err) {
+          addActivity(projectId, projectId, 'error', `Epic split failed: ${err.message}`);
+          ws.send(JSON.stringify({ type: 'error', text: `Epic split failed: ${err.message}` }));
+        }
         break;
       }
 
@@ -1225,18 +1369,12 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'graph-data', projectId: targetId, error: 'no-index' }));
           break;
         }
-        // Use --repo flag so gitnexus knows which of multiple indexed repos to query
-        const repoArg = `--repo ${JSON.stringify(projectPath)}`;
-        const NODE_LIMIT = 1000000000; // cap for readable visualization
+        // Use gitnexus LocalBackend API directly (CLI truncates at 64KB due to macOS pipe buffer)
+        const NODE_LIMIT = 2000;
 
         try {
-          const cypher = (q) => {
-            const result = execSync(`gitnexus cypher ${repoArg} ${JSON.stringify(q)}`, {
-              cwd: projectPath, timeout: 15000, maxBuffer: 32 * 1024 * 1024,
-              stdio: ['pipe', 'pipe', 'pipe'],
-            });
-            return JSON.parse(result.toString());
-          };
+          const gn = await getGitNexusBackend();
+          const cypher = async (q) => gn.callTool('cypher', { query: q, repo: projectPath });
           const parseTable = (md) => {
             if (!md) return [];
             const lines = md.trim().split('\n');
@@ -1251,23 +1389,29 @@ wss.on('connection', (ws) => {
           };
 
           // Fetch: exported functions first (most important), then fill up to NODE_LIMIT
-          const fnExported = parseTable(cypher(
+          const fnExported = parseTable((await cypher(
             `MATCH (n:Function) WHERE n.isExported = 'true' RETURN n.id AS id, n.name AS name, n.filePath AS file, n.startLine AS line, n.isExported AS exported LIMIT ${NODE_LIMIT}`
-          ).markdown);
+          )).markdown);
           const remaining = NODE_LIMIT - fnExported.length;
-          const fnOther = remaining > 0 ? parseTable(cypher(
+          const fnOther = remaining > 0 ? parseTable((await cypher(
             `MATCH (n:Function) WHERE n.isExported <> 'true' RETURN n.id AS id, n.name AS name, n.filePath AS file, n.startLine AS line, n.isExported AS exported LIMIT ${remaining}`
-          ).markdown) : [];
+          )).markdown) : [];
           const functions = [...fnExported, ...fnOther];
 
           const fnIds = new Set(functions.map(f => f.id));
 
           // Fetch clusters, edges, membership only for nodes we have
-          const clusters = parseTable(cypher(`MATCH (c:Community) RETURN c.id AS id, c.label AS label, c.symbolCount AS size, c.cohesion AS cohesion LIMIT 50`).markdown);
-          const allEdges = parseTable(cypher(`MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b:Function) WHERE a.isExported = 'true' OR b.isExported = 'true' RETURN a.id AS src, b.id AS tgt, r.confidence AS conf LIMIT 500`).markdown);
+          const [clustersRes, allEdgesRes, membershipRes, processesRes] = await Promise.all([
+            cypher(`MATCH (c:Community) RETURN c.id AS id, c.label AS label, c.symbolCount AS size, c.cohesion AS cohesion LIMIT 50`),
+            cypher(`MATCH (a:Function)-[r:CodeRelation {type: 'CALLS'}]->(b:Function) WHERE a.isExported = 'true' OR b.isExported = 'true' RETURN a.id AS src, b.id AS tgt, r.confidence AS conf LIMIT 2000`),
+            cypher(`MATCH (f:Function)-[:CodeRelation]->(c:Community) RETURN f.id AS fn, c.id AS cluster LIMIT ${NODE_LIMIT}`),
+            cypher(`MATCH (p:Process) RETURN p.id AS id, p.label AS label, p.processType AS type, p.stepCount AS steps, p.entryPointId AS entry LIMIT 50`),
+          ]);
+          const clusters = parseTable(clustersRes.markdown);
+          const allEdges = parseTable(allEdgesRes.markdown);
           const callEdges = allEdges.filter(e => fnIds.has(e.src) && fnIds.has(e.tgt));
-          const membership = parseTable(cypher(`MATCH (f:Function)-[:CodeRelation]->(c:Community) RETURN f.id AS fn, c.id AS cluster LIMIT ${NODE_LIMIT}`).markdown);
-          const processes = parseTable(cypher(`MATCH (p:Process) RETURN p.id AS id, p.label AS label, p.processType AS type, p.stepCount AS steps, p.entryPointId AS entry LIMIT 50`).markdown);
+          const membership = parseTable(membershipRes.markdown);
+          const processes = parseTable(processesRes.markdown);
 
           ws.send(JSON.stringify({
             type: 'graph-data', projectId: targetId,
@@ -1735,3 +1879,60 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => process.emit('SIGINT'));
+
+// ─── Phase 3: The Standup Room (Global Watcher) ──────────────────────────────
+const watercoolerPath = resolve(DEV_TEAM_ROOT, 'WATERCOOLER.md');
+if (!existsSync(watercoolerPath)) {
+  writeFileSync(watercoolerPath, '# Swarm Watercooler\\n\\nShared API schemas and progress updates go here.\\n');
+}
+
+let lastWatercoolerContent = '';
+try { lastWatercoolerContent = readFileSync(watercoolerPath, 'utf8'); } catch(e) {}
+
+chokidar.watch(watercoolerPath).on('change', () => {
+  let newContent = '';
+  try { newContent = readFileSync(watercoolerPath, 'utf8'); } catch(e) { return; }
+  
+  if (newContent === lastWatercoolerContent) return;
+
+  // Simple heuristic: find what was added at the end
+  let diff = '';
+  if (newContent.startsWith(lastWatercoolerContent)) {
+    diff = newContent.slice(lastWatercoolerContent.length).trim();
+  } else {
+    // Content was edited or prepended — just take the whole thing if it's small/new
+    diff = newContent.trim();
+  }
+
+  lastWatercoolerContent = newContent;
+  if (!diff) return;
+
+  const updateMsg = "\\n\\nGLOBAL TEAM UPDATE:\\n" + diff + "\\n";
+
+  const projects = loadProjects();
+  projects.forEach(p => {
+    const sessions = listAllSessions(p.id);
+    sessions.forEach(s => {
+      const sessDir = getSessionDir(s.sessionId, p.id);
+      const inboxPath = resolve(sessDir, 'CLAUDE_INBOX.md');
+      try {
+        const current = existsSync(inboxPath) ? readFileSync(inboxPath, 'utf8') : '';
+        writeFileSync(inboxPath, current + updateMsg);
+        
+        // Wake up if idle
+        if (s.status === 'idle' || s.status === 'stopped' || s.status === 'blocked') {
+           const statePath = resolve(sessDir, '.autopilot-state.json');
+           const state = safeJSON(statePath) || {};
+           writeFileSync(statePath, JSON.stringify({ 
+             ...state, 
+             status: 'needs_restart', 
+             updated_at: new Date().toISOString() 
+           }, null, 2));
+        }
+        addActivity(p.id, p.name, 'info', "Propagated watercooler update to session: " + s.name);
+      } catch (err) {
+        console.error("Failed to update inbox for session " + s.sessionId, err);
+      }
+    });
+  });
+});
