@@ -36,6 +36,13 @@ const PROJECTS_FILE      = resolve(DEV_TEAM_ROOT, 'projects.json');
 const PROJECTS_DATA_DIR  = resolve(DEV_TEAM_ROOT, '.projects');
 const SESSIONS_DIR       = resolve(DEV_TEAM_ROOT, 'sessions'); // legacy / dev-team's own sessions
 
+// ─── Autopilot Constants ─────────────────────────────────────────────────────
+const AUTOPILOT_COOLDOWN_MS     = 5000;     // 5s minimum between Claude restarts
+const AUTOPILOT_MAX_RETRIES     = 10;       // max consecutive restarts without progress
+const AUTOPILOT_MAX_RUNTIME_MS  = 600000;   // 10min max per Claude run
+const activeClaudeProcesses     = new Map(); // sessionKey → { process, startTime, projectId }
+const autopilotLocks            = new Set(); // sessionKeys currently being handled
+
 // Ensure projects root exists
 if (!existsSync(PROJECTS_ROOT)) mkdirSync(PROJECTS_ROOT, { recursive: true });
 
@@ -416,6 +423,239 @@ function addActivity(projectId, projectName, level, text) {
       try { ws.send(msg); } catch {}
     }
   }
+}
+
+// ─── Autopilot Reactor ───────────────────────────────────────────────────────
+//
+// Watches .autopilot-state.json changes and drives the autonomous loop:
+//   needs_restart      → spawn Claude Code
+//   waiting_for_gemini → feed Gemini the question, write answer, restart
+//   completed          → log + broadcast
+//   blocked            → log + broadcast, wait for human
+
+function findClaudePath() {
+  try { return execSync('which claude', { encoding: 'utf8' }).trim(); }
+  catch { return null; }
+}
+
+const CLAUDE_PATH = findClaudePath();
+
+function getAutopilotDir(sessionId, projectId) {
+  if (sessionId) return getSessionDir(sessionId, projectId);
+  const projects = loadProjects();
+  const project = projects.find(p => p.id === projectId);
+  return project?.path || DEV_TEAM_ROOT;
+}
+
+function handleAutopilotStateChange(sessionId, projectId) {
+  const key = sessionId || projectId;
+  if (autopilotLocks.has(key)) return;
+
+  const dir = getAutopilotDir(sessionId, projectId);
+  const state = safeJSON(resolve(dir, '.autopilot-state.json'));
+  if (!state) return;
+
+  const projectName = projectId || 'innorhl';
+
+  switch (state.status) {
+    case 'needs_restart':
+      scheduleClaudeRestart(sessionId, projectId, state, dir);
+      break;
+
+    case 'waiting_for_gemini':
+      feedGeminiQuestion(sessionId, projectId, dir);
+      break;
+
+    case 'completed':
+      addActivity(projectName, projectName, 'info',
+        `Autopilot completed — all ${state.total_tasks || 0} tasks done${sessionId ? ` (session: ${sessionId})` : ''}`);
+      if (projectId) recordSessionEnd(projectId, projectName, 'completed');
+      broadcastAll({ type: 'autopilot-status', projectId, sessionId, status: 'completed' });
+      break;
+
+    case 'blocked':
+      addActivity(projectName, projectName, 'warn',
+        `Autopilot blocked${state.blocker_reason ? ': ' + state.blocker_reason.slice(0, 200) : ''}${sessionId ? ` (session: ${sessionId})` : ''}`);
+      broadcastAll({ type: 'autopilot-status', projectId, sessionId, status: 'blocked', reason: state.blocker_reason });
+      break;
+
+    // in_progress, idle — do nothing
+  }
+}
+
+function scheduleClaudeRestart(sessionId, projectId, state, dir) {
+  const key = sessionId || projectId;
+
+  if (!CLAUDE_PATH) {
+    addActivity(projectId || 'innorhl', projectId || 'innorhl', 'error',
+      'Claude CLI not found — cannot auto-restart. Install Claude Code or set PATH.');
+    return;
+  }
+
+  // Cooldown check
+  const lastExit = state.last_claude_exit ? new Date(state.last_claude_exit).getTime() : 0;
+  const elapsed = Date.now() - lastExit;
+  if (elapsed < AUTOPILOT_COOLDOWN_MS) {
+    setTimeout(() => scheduleClaudeRestart(sessionId, projectId, state, dir),
+      AUTOPILOT_COOLDOWN_MS - elapsed);
+    return;
+  }
+
+  // Retry guard (on-claude-stop.js handles this too, but double-check)
+  if ((state.retry_count || 0) >= AUTOPILOT_MAX_RETRIES) {
+    writeFileSync(resolve(dir, '.autopilot-state.json'), JSON.stringify({
+      ...state, status: 'blocked',
+      blocker_reason: `Server-side: max retries (${AUTOPILOT_MAX_RETRIES}) reached`,
+      updated_at: new Date().toISOString(),
+    }, null, 2));
+    return;
+  }
+
+  autopilotLocks.add(key);
+
+  // Mark in_progress before spawning
+  writeFileSync(resolve(dir, '.autopilot-state.json'), JSON.stringify({
+    ...state, status: 'in_progress',
+    last_claude_start: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }, null, 2));
+
+  const projectPath = dir;
+  const env = { ...process.env, SESSION_ID: sessionId || '', PROJECT_DIR: projectPath };
+
+  addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
+    `Autopilot spawning Claude Code${sessionId ? ` (session: ${sessionId})` : ''} — ${state.remaining_tasks || '?'} tasks left`);
+
+  const claudeProcess = spawn(CLAUDE_PATH, [
+    '--print',
+    '--dangerously-skip-permissions',
+    'Read PLAN.md and execute the next unchecked task. Follow the CLAUDE.md startup checklist.',
+  ], { cwd: projectPath, env, stdio: ['pipe', 'pipe', 'pipe'] });
+
+  activeClaudeProcesses.set(key, { process: claudeProcess, startTime: Date.now(), projectId });
+
+  broadcastAll({ type: 'autopilot-status', projectId, sessionId, status: 'running' });
+
+  // Kill timer — prevent runaway Claude
+  const killTimer = setTimeout(() => {
+    if (claudeProcess.exitCode === null) {
+      addActivity(projectId || 'innorhl', projectId || 'innorhl', 'warn',
+        `Autopilot killing Claude — exceeded ${AUTOPILOT_MAX_RUNTIME_MS / 60000}min runtime limit`);
+      claudeProcess.kill('SIGTERM');
+      setTimeout(() => { if (claudeProcess.exitCode === null) claudeProcess.kill('SIGKILL'); }, 5000);
+    }
+  }, AUTOPILOT_MAX_RUNTIME_MS);
+
+  claudeProcess.on('exit', (code) => {
+    clearTimeout(killTimer);
+    activeClaudeProcesses.delete(key);
+    autopilotLocks.delete(key);
+
+    addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
+      `Claude exited (code ${code})${sessionId ? ` — session: ${sessionId}` : ''}`);
+    broadcastAll({ type: 'autopilot-status', projectId, sessionId, status: 'stopped', exitCode: code });
+
+    // The Stop hook (on-claude-stop.js) will write the next state,
+    // which triggers the file watcher, which calls handleAutopilotStateChange again.
+    // The loop continues automatically.
+  });
+
+  // Capture stdout/stderr for activity log
+  let outputBuffer = '';
+  claudeProcess.stdout.on('data', (data) => {
+    outputBuffer += data.toString();
+    if (outputBuffer.length > 10000) outputBuffer = outputBuffer.slice(-10000);
+  });
+  claudeProcess.stderr.on('data', (data) => {
+    const line = data.toString().trim();
+    if (line) addActivity(projectId || 'innorhl', projectId || 'innorhl', 'warn', `Claude stderr: ${line.slice(0, 300)}`);
+  });
+
+  // Store output for later retrieval
+  claudeProcess.on('exit', () => {
+    if (outputBuffer.trim()) {
+      const outputPath = resolve(dir, '.last-claude-output.txt');
+      try { writeFileSync(outputPath, outputBuffer); } catch {}
+    }
+  });
+}
+
+async function feedGeminiQuestion(sessionId, projectId, dir) {
+  const key = sessionId || projectId;
+  autopilotLocks.add(key);
+
+  const inboxPath  = resolve(dir, 'GEMINI_INBOX.md');
+  const answerPath = resolve(dir, 'CLAUDE_INBOX.md');
+  const planPath   = resolve(dir, 'PLAN.md');
+  const statePath  = resolve(dir, '.autopilot-state.json');
+
+  if (!existsSync(inboxPath)) {
+    writeFileSync(statePath, JSON.stringify({
+      status: 'blocked', blocker_reason: 'GEMINI_INBOX.md not found',
+      updated_at: new Date().toISOString(),
+    }, null, 2));
+    autopilotLocks.delete(key);
+    return;
+  }
+
+  if (!GEMINI_PATH) {
+    writeFileSync(statePath, JSON.stringify({
+      status: 'blocked', blocker_reason: 'Gemini CLI not found — cannot answer question',
+      updated_at: new Date().toISOString(),
+    }, null, 2));
+    autopilotLocks.delete(key);
+    return;
+  }
+
+  const question = readFileSync(inboxPath, 'utf8');
+  const planContext = existsSync(planPath) ? readFileSync(planPath, 'utf8').slice(0, 3000) : '';
+
+  const prompt = [
+    'Claude Code is asking you this question while executing a plan.',
+    'Here is the current PLAN.md for context:',
+    '---',
+    planContext,
+    '---',
+    'Claude\'s question:',
+    question,
+    '---',
+    'Provide a clear, specific answer that Claude can act on immediately.',
+    'If you need to make an architecture decision, be decisive — don\'t hedge.',
+  ].join('\n');
+
+  addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
+    `Feeding Gemini Claude's question${sessionId ? ` (session: ${sessionId})` : ''}`);
+
+  try {
+    const { stdout } = await execPromise(
+      `${GEMINI_PATH} -p ${JSON.stringify(prompt)}`,
+      { cwd: dir, timeout: 120000 }
+    );
+
+    writeFileSync(answerPath, `## Gemini's Answer\n\n${stdout}\n`);
+
+    // Set state to needs_restart → triggers Claude restart via watcher
+    const state = safeJSON(statePath) || {};
+    writeFileSync(statePath, JSON.stringify({
+      ...state,
+      status: 'needs_restart',
+      updated_at: new Date().toISOString(),
+    }, null, 2));
+
+    addActivity(projectId || 'innorhl', projectId || 'innorhl', 'info',
+      `Gemini answered — Claude will restart${sessionId ? ` (session: ${sessionId})` : ''}`);
+
+  } catch (err) {
+    writeFileSync(statePath, JSON.stringify({
+      status: 'blocked',
+      blocker_reason: `Gemini failed: ${err.message}`,
+      updated_at: new Date().toISOString(),
+    }, null, 2));
+    addActivity(projectId || 'innorhl', projectId || 'innorhl', 'error',
+      `Gemini failed: ${err.message.slice(0, 200)}`);
+  }
+
+  autopilotLocks.delete(key);
 }
 
 // ─── Express + WebSocket ─────────────────────────────────────────────────────
@@ -875,7 +1115,9 @@ async function handleAction(action, projectId, ws) {
       const state    = safeJSON(files.state) || {};
       const remaining = state.remaining_tasks || 0;
       writeFileSync(files.state, JSON.stringify(
-        { ...state, status: remaining > 0 ? 'in_progress' : 'idle', updated_at: new Date().toISOString() }, null, 2
+        { ...state, status: remaining > 0 ? 'needs_restart' : 'idle',
+          retry_count: 0, blocker_reason: null,
+          updated_at: new Date().toISOString() }, null, 2
       ));
       addActivity(projectId, project.name, 'info', 'Autopilot RESUMED');
       break;
@@ -907,21 +1149,21 @@ const TEMPLATE_DIR = resolve(INNORHL_ROOT, 'core-template');
 
 // Items that become SYMLINKS in the project (dynamic — always in sync with template)
 const TEMPLATE_SYMLINKS = [
-  { name: 'CLAUDE.md',    isDir: false },
-  { name: 'GEMINI.md',    isDir: false },
-  { name: '.mcp.json',    isDir: false },
-  { name: '.agents',      isDir: true  },
-  { name: '.claude/agents', isDir: true },
-  { name: '.claude/skills', isDir: true },
+  { name: 'CLAUDE.md',            isDir: false },
+  { name: 'GEMINI.md',            isDir: false },
+  { name: '.mcp.json',            isDir: false },
+  { name: '.claude/settings.json', isDir: false },
+  { name: '.agents',              isDir: true  },
+  { name: '.claude/agents',       isDir: true  },
+  { name: '.claude/skills',       isDir: true  },
 ];
 
 // Items that are COPIED once (project-specific, can be modified)
 const TEMPLATE_COPIES = [
-  { name: '.env.example',   dest: '.env.example' },
-  { name: 'JOURNAL.md',     dest: 'JOURNAL.md'   },
-  { name: 'KNOWN_BUGS.md',  dest: 'KNOWN_BUGS.md' },
-  { name: '.gitignore.template', dest: '.gitignore' },
-  { name: '.claude/settings.json', dest: '.claude/settings.json' },
+  { name: '.env.example',         dest: '.env.example' },
+  { name: 'JOURNAL.md',           dest: 'JOURNAL.md'   },
+  { name: 'KNOWN_BUGS.md',        dest: 'KNOWN_BUGS.md' },
+  { name: '.gitignore.template',  dest: '.gitignore'    },
 ];
 
 function makeSymlink(src, dest) {
@@ -1012,6 +1254,9 @@ function setupProjectWatcher(project) {
         recordSessionEnd(project.id, project.name, newStatus || 'unknown');
       }
       stateTracker.prevStatus = newStatus;
+
+      // Autopilot reactor — drive the autonomous loop
+      handleAutopilotStateChange(null, project.id);
     }
 
     addActivity(project.id, project.name, 'info', `${label} updated`);
@@ -1044,6 +1289,8 @@ function setupSessionFileWatcher(sessionId, projectId) {
     resolve(dir, 'JOURNAL.md'),
     resolve(dir, 'TEST_RESULTS.md'),
     resolve(dir, 'GEMINI_REVIEW.md'),
+    resolve(dir, 'GEMINI_INBOX.md'),
+    resolve(dir, 'CLAUDE_INBOX.md'),
   ];
 
   const watcher = chokidar.watch(watchPaths, {
@@ -1053,7 +1300,13 @@ function setupSessionFileWatcher(sessionId, projectId) {
 
   watcher.on('change', (changedPath) => {
     const label = changedPath.split('/').pop();
-    addActivity('innorhl', `session:${sessionId}`, 'info', `[${sessionId}] ${label} updated`);
+    addActivity(projectId || 'innorhl', `session:${sessionId}`, 'info', `[${sessionId}] ${label} updated`);
+
+    // Autopilot reactor — drive the autonomous loop for this session
+    if (changedPath.endsWith('.autopilot-state.json')) {
+      handleAutopilotStateChange(sessionId, projectId);
+    }
+
     // Broadcast updated session state to all clients
     const state = getSessionState(sessionId);
     const msg   = JSON.stringify({ type: 'session-state', ...state });
@@ -1077,9 +1330,44 @@ function initSessionWatchers() {
   } catch {}
 }
 
+// ─── Stale session recovery ──────────────────────────────────────────────────
+// On startup, any session stuck in "in_progress" is stale (Claude was killed
+// when the server stopped). Reset them to "needs_restart" so the loop resumes.
+
+function recoverStaleSessions() {
+  const projects = loadProjects();
+  for (const project of projects) {
+    const sessions = listAllSessions(project.id);
+    for (const sess of sessions) {
+      if (sess.status === 'in_progress') {
+        const dir = getSessionDir(sess.sessionId, project.id);
+        const statePath = resolve(dir, '.autopilot-state.json');
+        const state = safeJSON(statePath) || {};
+        writeFileSync(statePath, JSON.stringify({
+          ...state, status: 'needs_restart',
+          updated_at: new Date().toISOString(),
+        }, null, 2));
+        console.log(`  ↻ Recovered stale session: ${sess.name || sess.sessionId}`);
+      }
+    }
+
+    // Also check project-level state
+    const files = getProjectFiles(project);
+    const projState = safeJSON(files.state);
+    if (projState?.status === 'in_progress') {
+      writeFileSync(files.state, JSON.stringify({
+        ...projState, status: 'needs_restart',
+        updated_at: new Date().toISOString(),
+      }, null, 2));
+      console.log(`  ↻ Recovered stale project: ${project.name}`);
+    }
+  }
+}
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 const projects = loadProjects();
+recoverStaleSessions();
 for (const project of projects) {
   setupProjectWatcher(project);
 }
@@ -1090,6 +1378,8 @@ server.listen(PORT, () => {
   console.log(`  ─────────────────────`);
   console.log(`  http://localhost:${PORT}`);
   console.log(`  Gemini CLI : ${GEMINI_PATH || 'NOT FOUND'}`);
+  console.log(`  Claude CLI : ${CLAUDE_PATH || 'NOT FOUND'}`);
+  console.log(`  Autopilot  : ${CLAUDE_PATH && GEMINI_PATH ? 'READY' : 'DEGRADED (missing CLI)'}`);
   console.log(`  Projects   : ${projects.length}`);
   projects.forEach(p => console.log(`    - ${p.name} (${p.path})`));
   console.log(`  Sessions   : ${listAllSessions().length} active`);
@@ -1097,6 +1387,10 @@ server.listen(PORT, () => {
 });
 
 process.on('SIGINT', () => {
+  // Kill all active Claude autopilot processes
+  for (const [, entry] of activeClaudeProcesses) {
+    if (entry.process) { try { entry.process.kill(); } catch {} }
+  }
   for (const [, w] of projectWatchers) w.close();
   for (const [, w] of sessionFileWatchers) w.close();
   for (const [, client] of clients) {
