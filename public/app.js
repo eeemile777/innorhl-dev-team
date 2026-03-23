@@ -57,6 +57,108 @@ const taskList    = $('task-list');
 const logOutput   = $('log-output');
 const activityFeed = $('activity-feed');
 
+// ─── Command Palette (Phase 4) ──────────────────────────────────────────────
+const commandPalette = $('command-palette');
+const commandInput   = $('command-input');
+const commandResults = $('command-results');
+
+const COMMANDS = [
+  { id: 'analyze', name: '⚡ Build Code Graph / Analyze', icon: '🔍', action: () => analyzeCurrentProject(), keys: 'A' },
+  { id: 'refresh', name: '↺ Refresh All Templates', icon: '🔄', action: () => refreshAllTemplates(), keys: 'R' },
+  { id: 'epic', name: '🚀 Launch Epic Swarm', icon: '🐝', action: () => navigateToPanel('sessions'), keys: 'E' },
+  { id: 'locks', name: '🔒 View Live Locks', icon: '🛡️', action: () => navigateToPanel('overview'), keys: 'L' },
+  { id: 'push', name: '⬆ Push to Main Origin', icon: '📤', action: () => pushToMainBranch(), keys: 'P' },
+  { id: 'clear', name: '🗑 Clear Terminal', icon: '🧹', action: () => clearTerminal(), keys: 'C' },
+];
+
+let selectedCommandIndex = 0;
+
+window.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    toggleCommandPalette();
+  }
+  if (e.key === 'Escape' && !commandPalette.classList.contains('hidden')) {
+    toggleCommandPalette();
+  }
+});
+
+function toggleCommandPalette() {
+  commandPalette.classList.toggle('hidden');
+  if (!commandPalette.classList.contains('hidden')) {
+    commandInput.value = '';
+    commandInput.focus();
+    renderCommandResults();
+  }
+}
+
+commandInput.addEventListener('input', () => {
+  selectedCommandIndex = 0;
+  renderCommandResults();
+});
+
+commandInput.addEventListener('keydown', (e) => {
+  const results = commandResults.querySelectorAll('.command-item');
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    selectedCommandIndex = (selectedCommandIndex + 1) % results.length;
+    renderCommandResults();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    selectedCommandIndex = (selectedCommandIndex - 1 + results.length) % results.length;
+    renderCommandResults();
+  } else if (e.key === 'Enter') {
+    const selected = results[selectedCommandIndex];
+    if (selected) selected.click();
+  }
+});
+
+function renderCommandResults() {
+  const query = commandInput.value.toLowerCase();
+  const filtered = COMMANDS.filter(c => c.name.toLowerCase().includes(query));
+  
+  commandResults.innerHTML = filtered.map((c, i) => `
+    <div class="command-item ${i === selectedCommandIndex ? 'selected' : ''}" onclick="executeCommand('${c.id}')">
+      <span class="command-item-icon">${c.icon}</span>
+      <span class="command-item-label">${c.name}</span>
+      <span class="command-item-key">${c.keys}</span>
+    </div>
+  `).join('');
+}
+
+function executeCommand(id) {
+  const cmd = COMMANDS.find(c => c.id === id);
+  if (cmd) {
+    toggleCommandPalette();
+    cmd.action();
+  }
+}
+window.executeCommand = executeCommand;
+
+// ─── Terminal Tabs (Phase 4) ────────────────────────────────────────────────
+function switchTerminalTab(tabId) {
+  const tabs = document.querySelectorAll('.terminal-tab');
+  tabs.forEach(t => t.classList.remove('active'));
+  const activeTab = document.getElementById(`tab-${tabId}`);
+  if (activeTab) activeTab.classList.add('active');
+  
+  showToast(`Switching to ${tabId} terminal...`, 'processing');
+  // Logic to switch pty stream would go here in a real multi-pty environment
+}
+window.switchTerminalTab = switchTerminalTab;
+
+function clearTerminal() {
+  if (terminal) terminal.clear();
+  showToast('Terminal cleared', 'success');
+}
+window.clearTerminal = clearTerminal;
+
+function pushToMainBranch() {
+  showToast('Pushing everything to main origin...', 'processing');
+  // Logic to trigger server-side push
+  ws.send(JSON.stringify({ type: 'action', action: 'push', projectId: activeProject }));
+}
+
 // ─── Notifications ───────────────────────────────────────────────────────────
 
 let notificationsEnabled = false;
@@ -1736,8 +1838,38 @@ function renderCodeGraph(data) {
   const g = svg.append('g');
   const zoomBehavior = d3.zoom()
     .scaleExtent([0.15, 4])
-    .on('zoom', (event) => g.attr('transform', event.transform));
+    .on('zoom', (event) => {
+      g.attr('transform', event.transform);
+      updateMinimap(event.transform);
+    });
   svg.call(zoomBehavior);
+
+  // --- Minimap (Phase 5) ---
+  const minimapSize = 120;
+  const minimapWrap = d3.select(container).append('div')
+    .style('position', 'absolute').style('bottom', '20px').style('right', '20px')
+    .style('width', minimapSize + 'px').style('height', minimapSize + 'px')
+    .style('background', 'rgba(0,0,0,0.5)').style('border', '1px solid var(--border-active)')
+    .style('border-radius', '8px').style('backdrop-filter', 'blur(4px)')
+    .style('pointer-events', 'none').style('overflow', 'hidden');
+
+  const minimapSvg = minimapWrap.append('svg')
+    .attr('width', '100%').attr('height', '100%')
+    .attr('viewBox', [0, 0, width, height]);
+
+  const minimapView = minimapSvg.append('rect')
+    .attr('class', 'minimap-view')
+    .attr('fill', 'rgba(255,255,255,0.05)')
+    .attr('stroke', 'var(--accent)')
+    .attr('stroke-width', 2);
+
+  function updateMinimap(transform) {
+    const vWidth = width / transform.k;
+    const vHeight = height / transform.k;
+    const vX = -transform.x / transform.k;
+    const vY = -transform.y / transform.k;
+    minimapView.attr('x', vX).attr('y', vY).attr('width', vWidth).attr('height', vHeight);
+  }
 
   // Render edges as curved paths
   const linkG = g.append('g').attr('class', 'cg-links');
@@ -1808,7 +1940,7 @@ function renderCodeGraph(data) {
     .attr('fill-opacity', 0.35);
 
   // Labels — only visible for exported nodes by default
-  nodeSel.append('text')
+  const labelSel = nodeSel.append('text')
     .attr('class', d => 'cg-node-label' + (d.exported ? ' cg-label-visible' : ''))
     .attr('dy', d => d.radius + 12)
     .attr('text-anchor', 'middle')
@@ -1947,6 +2079,49 @@ function renderCodeGraph(data) {
       });
       nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
     });
+
+  // --- Interactive Legend (Phase 5) ---
+  const hiddenClusters = new Set();
+  const legendContainer = document.getElementById('code-graph-legend');
+  if (legendContainer) {
+    legendContainer.innerHTML = '<div style="font-size:10px; font-weight:700; color:var(--text-muted); margin-bottom:10px; text-transform:uppercase; letter-spacing:1px; padding:0 10px">Functional Clusters</div>';
+    const clusterSummary = {};
+    nodes.forEach(n => {
+      if (!clusterSummary[n.cluster]) clusterSummary[n.cluster] = { color: n.color, count: 0 };
+      clusterSummary[n.cluster].count++;
+    });
+    
+    Object.entries(clusterSummary).forEach(([cId, info]) => {
+      const item = document.createElement('div');
+      item.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 10px;cursor:pointer;font-size:11px;border-radius:8px;transition:0.2s;margin-bottom:4px;background:rgba(255,255,255,0.03);border:1px solid transparent;';
+      item.className = 'cg-legend-item';
+      item.innerHTML = `
+        <input type="checkbox" checked style="accent-color:${info.color}; width:14px; height:14px; cursor:pointer">
+        <span style="width:8px; height:8px; border-radius:50%; background:${info.color}; box-shadow:0 0 8px ${info.color}"></span>
+        <span style="flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis">${escHtml(cId)}</span>
+        <span style="color:var(--text-muted); font-family:var(--font-mono); font-size:10px">${info.count}</span>
+      `;
+      item.onclick = (e) => {
+        const cb = item.querySelector('input');
+        if (e.target !== cb) cb.checked = !cb.checked;
+        if (cb.checked) {
+          hiddenClusters.delete(cId);
+          item.style.opacity = '1';
+          item.style.borderColor = 'transparent';
+        } else {
+          hiddenClusters.add(cId);
+          item.style.opacity = '0.5';
+          item.style.borderColor = 'rgba(255,255,255,0.05)';
+        }
+        
+        // Filter graph elements
+        nodeSel.transition().duration(300).style('opacity', d => hiddenClusters.has(d.cluster) ? 0 : 1).style('pointer-events', d => hiddenClusters.has(d.cluster) ? 'none' : 'auto');
+        linkSel.transition().duration(300).style('opacity', d => (hiddenClusters.has(d.source.cluster) || hiddenClusters.has(d.target.cluster)) ? 0 : 0.4).style('pointer-events', d => (hiddenClusters.has(d.source.cluster) || hiddenClusters.has(d.target.cluster)) ? 'none' : 'auto');
+        labelSel.transition().duration(300).style('opacity', d => hiddenClusters.has(d.cluster) ? 0 : 0.8);
+      };
+      legendContainer.appendChild(item);
+    });
+  }
 
   codeGraphEnv = { svg, g, sim, zoomBehavior, width, height, nodeSel, linkSel, nodes, links };
 
@@ -2195,16 +2370,69 @@ function showToast(message, type = 'info') {
   if (!container) {
     container = document.createElement('div');
     container.id = 'toast-container';
-    container.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;';
+    container.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:10px;';
     document.body.appendChild(container);
   }
   const toast = document.createElement('div');
-  const bg = type === 'error' ? '#e55' : type === 'warn' ? '#e93' : '#2a9d8f';
-  toast.style.cssText = `background:${bg};color:#fff;padding:12px 18px;border-radius:8px;font-size:13px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,0.4);cursor:pointer;`;
-  toast.textContent = message;
-  toast.onclick = () => toast.remove();
+  
+  let icon = 'ℹ️';
+  let bg = 'rgba(18,18,18,0.9)';
+  let border = 'rgba(255,255,255,0.1)';
+  
+  if (type === 'error') { icon = '❌'; border = 'var(--red)'; }
+  if (type === 'success') { icon = '✅'; border = 'var(--green)'; }
+  if (type === 'warn') { icon = '⚠️'; border = 'var(--orange)'; }
+  if (type === 'processing') { icon = '⏳'; border = 'var(--purple)'; }
+
+  toast.style.cssText = `
+    background:${bg};
+    color:var(--text);
+    padding:14px 20px;
+    border-radius:var(--radius-sm);
+    font-size:13px;
+    font-weight:600;
+    max-width:360px;
+    box-shadow:0 8px 32px rgba(0,0,0,0.5);
+    border:1px solid ${border};
+    backdrop-filter:blur(10px);
+    display:flex;
+    align-items:center;
+    gap:12px;
+    cursor:pointer;
+    animation: slide-up 0.3s ease;
+    transition: opacity 0.3s;
+  `;
+  
+  toast.innerHTML = `<span>${icon}</span> <span>${escHtml(message)}</span>`;
+  toast.onclick = () => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); };
   container.appendChild(toast);
-  setTimeout(() => toast.remove(), 6000);
+  
+  setTimeout(() => {
+    if (toast.parentElement) {
+      toast.style.opacity = '0';
+      setTimeout(() => toast.remove(), 300);
+    }
+  }, 5000);
+}
+
+function setBtnLoading(btnId, isLoading) {
+  const btn = typeof btnId === 'string' ? $(btnId) : btnId;
+  if (!btn) return;
+  if (isLoading) {
+    btn.classList.add('btn-loading');
+    btn.disabled = true;
+  } else {
+    btn.classList.remove('btn-loading');
+    btn.disabled = false;
+  }
+}
+
+function showSkeleton(elId, count = 3) {
+  const el = typeof elId === 'string' ? $(elId) : elId;
+  if (!el) return;
+  el.innerHTML = Array(count).fill(0).map(() => `
+    <div class="skeleton" style="height:18px; margin-bottom:10px; border-radius:4px; width:${Math.floor(Math.random() * 40) + 50}%"></div>
+  `).join('');
 }
 
 function escHtml(str) {

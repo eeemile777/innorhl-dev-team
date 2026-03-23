@@ -116,61 +116,68 @@
 
         <!-- OVERVIEW (was Status) -->
         <div class="panel active" id="panel-overview" role="tabpanel">
-
-          <!-- Hero state card -->
-          <div class="status-hero" id="status-hero">
-            <div class="status-hero-left">
-              <div class="status-icon" id="status-icon">⏸</div>
-              <div class="status-hero-text">
-                <div class="status-hero-label">Autopilot Status</div>
-                <div class="status-hero-value" id="autopilot-status">idle</div>
+          <!-- Bento Grid Overview (Phase 2) -->
+          <div class="bento-grid">
+            
+            <!-- Hero state card (Span 2) -->
+            <div class="status-hero bento-cell-span-2" id="status-hero">
+              <div class="status-hero-left">
+                <div class="status-icon" id="status-icon">⏸</div>
+                <div class="status-hero-text">
+                  <div class="status-hero-label">Control Room Status</div>
+                  <div class="status-hero-value" id="autopilot-status">idle</div>
+                </div>
+              </div>
+              <div class="status-actions">
+                <button class="btn-sm" id="btn-start-autopilot" onclick="startAutopilot()">▶ Start</button>
+                <button class="btn-sm" id="btn-pause" onclick="doAction('pause')">Pause</button>
+                <button class="btn-sm primary" id="btn-resume" onclick="doAction('resume')">Resume</button>
+                <button class="btn-sm danger" onclick="if(confirm('Rollback?')) doAction('rollback')">Rollback</button>
               </div>
             </div>
-            <div class="status-actions">
-              <button class="btn-sm" id="btn-start-autopilot" onclick="startAutopilot()" title="Start autopilot — Claude begins executing the plan">▶ Start</button>
-              <button class="btn-sm" id="btn-pause" onclick="doAction('pause')">Pause</button>
-              <button class="btn-sm primary" id="btn-resume" onclick="doAction('resume')">Resume</button>
-              <button class="btn-sm danger"
-                onclick="if(confirm('Rollback to previous git snapshot?')) doAction('rollback')">Rollback</button>
-            </div>
-          </div>
 
-          <!-- Progress -->
-          <div class="card">
-            <div class="card-label">Progress</div>
-            <div class="progress-bar">
-              <div class="progress-fill" id="progress-fill"></div>
+            <!-- Progress Card -->
+            <div class="card bento-cell">
+              <div class="card-label">Overall Progress</div>
+              <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill"></div>
+              </div>
+              <div class="progress-text">
+                <span class="progress-nums"><span id="tasks-done">0</span> / <span id="tasks-total">0</span></span>
+                <span>tasks complete</span>
+              </div>
             </div>
-            <div class="progress-text">
-              <span class="progress-nums"><span id="tasks-done">0</span> / <span id="tasks-total">0</span></span>
-              &nbsp;tasks complete
-            </div>
-          </div>
 
-          <!-- Plan + Journal side by side on desktop -->
-          <div class="plan-journal-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-            <div class="card">
-              <div class="card-label">Current Plan</div>
+            <!-- Current Plan -->
+            <div class="card bento-cell">
+              <div class="card-label">Current Strategic Plan</div>
               <div id="plan-context" class="card-content dimmed">No active plan</div>
             </div>
-            <div class="card">
-              <div class="card-label">Last Journal Entry</div>
+
+            <!-- Last Journal Entry -->
+            <div class="card bento-cell">
+              <div class="card-label">Execution Journal</div>
               <div id="journal-summary" class="card-content dimmed">No entries yet</div>
             </div>
-          </div>
 
-          <!-- Active Sessions Overview -->
-          <div class="card-label" style="margin-top:16px">Active Sessions</div>
-          <div id="sessions-overview" class="sessions-overview">
-            <div class="dimmed" style="padding:12px">No sessions yet — create one in the Sessions panel.</div>
-          </div>
+            <!-- Live Locks Panel -->
+            <div class="card bento-cell" id="live-locks-panel">
+              <div class="card-label" style="display:flex; justify-content:space-between">
+                <span>Active File Locks</span>
+                <span class="badge highlight" style="font-size:9px">Safety Protocol</span>
+              </div>
+              <div id="live-locks-content" class="dimmed" style="padding:12px; font-size:12px">No active locks.</div>
+            </div>
 
-          <!-- Live Locks Panel (Phase 1) -->
-          <div class="card-label" style="margin-top:16px">Live Locks</div>
-          <div class="card" id="live-locks-panel">
-            <div id="live-locks-content" class="dimmed" style="padding:12px">No active file locks.</div>
-          </div>
+            <!-- Active Sessions Overview -->
+            <div class="card bento-cell">
+              <div class="card-label">Swarm Activity</div>
+              <div id="sessions-overview" class="sessions-overview">
+                <div class="dimmed" style="padding:12px; font-size:12px">No swarm tracks active.</div>
+              </div>
+            </div>
 
+          </div> <!-- End Bento Grid -->
         </div>
 
         <!-- SESSIONS (was panel-chat) -->
@@ -221,6 +228,16 @@
           </div>
           <div class="code-graph-wrap">
             <div id="code-graph-container" class="code-graph-container"></div>
+            <!-- Terminal Header with Tabs (Phase 4) -->
+          <div class="terminal-header">
+            <div class="terminal-tabs" id="terminal-tabs">
+              <div class="terminal-tab active" id="tab-main" onclick="switchTerminalTab('main')">Main Process</div>
+            </div>
+            <div class="terminal-actions">
+              <button class="btn-xs" onclick="clearTerminal()">Clear</button>
+            </div>
+          </div>
+          <div id="terminal" class="terminal-container"></div>
           </div>
           <div class="code-graph-legend" id="code-graph-legend"></div>
           <div class="code-graph-detail" id="code-graph-detail">
@@ -395,6 +412,19 @@
 
   </div>
 
+  <!-- Command Palette Modal (Phase 4) -->
+  <div id="command-palette" class="modal-overlay hidden" style="z-index:10000">
+    <div class="modal-content command-palette-content">
+      <div class="command-palette-header">
+        <span class="nav-icon">⌘</span>
+        <input type="text" id="command-input" placeholder="Type a command (Analyze, Push, Restart...)" autocomplete="off" />
+        <span class="command-palette-hint">ESC to close</span>
+      </div>
+      <div id="command-results" class="command-results"></div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
   <script src="app.js"></script>
 </body>
 
