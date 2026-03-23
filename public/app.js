@@ -271,6 +271,7 @@ function handleMessage(msg) {
 
     case 'session-list': {
       allSessions = msg.sessions || [];
+      if (typeof cacheSessionsForQuickSwitch === 'function') cacheSessionsForQuickSwitch(allSessions);
       renderSessionCards();
       renderSessionsOverview();
       renderAgentsSessionSelect();
@@ -278,6 +279,15 @@ function handleMessage(msg) {
       renderSessionTasksInTab();
       renderLogTab();
       renderUsageTab();
+      break;
+    }
+
+    case 'watercooler-update': {
+      // Feature 4: Watercooler ticker update
+      const entry = msg.diff || msg.message || msg.content;
+      if (entry && typeof updateWatercoolerTicker === 'function') {
+        updateWatercoolerTicker(`[${new Date().toLocaleTimeString()}] ${entry.trim().slice(0, 120)}`);
+      }
       break;
     }
 
@@ -696,6 +706,8 @@ function updateAgentBadge(status) {
   agentBadge.className = 'agent-badge';
   agentBadge.classList.add(badgeMap[status] || 'idle');
   agentBadge.textContent = badgeLabels[status] || status.replace(/_/g, ' ').toUpperCase();
+  // Feature 5: Header bloom glow
+  if (typeof applyHeaderBloom === 'function') applyHeaderBloom(badgeMap[status] || 'idle');
 }
 
 // ─── State rendering ──────────────────────────────────────────────────────────
@@ -789,6 +801,16 @@ function renderSessionTasksInTab() {
       </div>`;
     }).join('')}
   `;
+
+  // Feature 2: Update step tracker in agent-flow panel
+  if (typeof updateStepTracker === 'function') {
+    const trackerTasks = tasks.map((t, i) => ({
+      text: t.text,
+      done: t.done,
+      active: i === firstPending && !t.done,
+    }));
+    updateStepTracker(trackerTasks);
+  }
 }
 
 // ─── Session Cards + Modal System ─────────────────────────────────────────────
@@ -1194,6 +1216,21 @@ function initAgentFlowTerminal(sessionId) {
   });
   agentFlowFitAddon = new FitAddon.FitAddon();
   agentFlowTerminal.loadAddon(agentFlowFitAddon);
+
+  // Feature 2: xterm web-links for file path detection
+  if (typeof WebLinksAddon !== 'undefined') {
+    const webLinksAddon = new WebLinksAddon.WebLinksAddon((e, uri) => {
+      if (/^\//.test(uri) || /^[A-Za-z]:\\/.test(uri)) {
+        navigator.clipboard.writeText(uri).then(() => {
+          showToast(`Path copied: ${uri.split('/').slice(-2).join('/')}`, 'success');
+        });
+      }
+    }, {
+      urlRegex: /([\/][a-zA-Z0-9._~:@!$&'()*+,;=%/-]+\.[a-zA-Z]{2,6})/g
+    });
+    agentFlowTerminal.loadAddon(webLinksAddon);
+  }
+
   agentFlowTerminal.open(canvas);
   agentFlowTerminal.write('\x1b[36mConnecting to Gemini...\x1b[0m\r\n');
 
@@ -1202,6 +1239,8 @@ function initAgentFlowTerminal(sessionId) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'start-gemini', sessionId, force: false }));
     }
+    // Feature 1: Initialize resizable split panels
+    initSplitPanels();
   }, 80);
 
   agentFlowTerminal.onData(data => {
@@ -2517,3 +2556,268 @@ function submitEpic() {
   }, 5000);
 }
 window.submitEpic = submitEpic;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WAVE 2 JAVASCRIPT ENHANCEMENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Feature 1: Resizable Split Panels ─────────────────────────────────────
+function initSplitPanels() {
+  const left   = $('split-left');
+  const gutter = $('split-gutter');
+  const right  = $('split-right');
+  if (!left || !gutter || !right) return;
+
+  let dragging = false;
+  let startX = 0;
+  let startLeft = 0;
+  const parent = left.parentElement;
+
+  gutter.addEventListener('mousedown', (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startLeft = left.offsetWidth;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const parentW = parent.offsetWidth - gutter.offsetWidth;
+    const newLeft = Math.max(200, Math.min(startLeft + dx, parentW - 200));
+    const newRight = parentW - newLeft;
+    left.style.flex = 'none';
+    left.style.width = newLeft + 'px';
+    right.style.flex = 'none';
+    right.style.width = newRight + 'px';
+    // Refit terminal after resize
+    if (window.agentFlowFitAddon) { try { window.agentFlowFitAddon.fit(); } catch {} }
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  });
+}
+window.initSplitPanels = initSplitPanels;
+
+// ─── Feature 1: Header Quick-Switch Dropdown ───────────────────────────────
+function toggleSessionQuickSwitch() {
+  const dropdown = $('quick-switch-dropdown');
+  if (!dropdown) return;
+
+  if (!dropdown.classList.contains('hidden')) {
+    dropdown.classList.add('hidden');
+    return;
+  }
+
+  const sessions = window._lastSessions || [];
+  if (sessions.length === 0) {
+    dropdown.innerHTML = '<div class="qs-label">No sessions available</div>';
+  } else {
+    dropdown.innerHTML = `
+      <div class="qs-label">Switch Session</div>
+      ${sessions.map(s => `
+        <div class="qs-item ${s.id === activeSession ? 'active' : ''}" onclick="selectSession('${s.id}'); $('quick-switch-dropdown').classList.add('hidden')">
+          <span>${s.status === 'running' ? '▶' : s.status === 'done' ? '✓' : '⏸'}</span>
+          <span>${escHtml(s.branch || s.id.slice(0, 12))}</span>
+        </div>`).join('')}
+    `;
+  }
+  dropdown.classList.remove('hidden');
+
+  // Auto-close on outside click
+  const close = (e) => {
+    if (!dropdown.contains(e.target) && e.target.id !== 'header-session-context') {
+      dropdown.classList.add('hidden');
+      document.removeEventListener('click', close);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', close), 0);
+}
+window.toggleSessionQuickSwitch = toggleSessionQuickSwitch;
+
+// ─── Feature 2: Step Tracker ───────────────────────────────────────────────
+function updateStepTracker(tasks) {
+  const tracker = document.getElementById('step-tracker');
+  if (!tracker || !tasks || tasks.length === 0) return;
+
+  tracker.innerHTML = tasks.slice(0, 8).map((t, i) => `
+    <div class="step-track-item ${t.done ? 'done' : t.active ? 'active' : ''}">
+      <div class="step-num">${t.done ? '✓' : i + 1}</div>
+      <div style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">${escHtml(t.text || t.description || 'Task ' + (i+1))}</div>
+    </div>
+  `).join('');
+}
+window.updateStepTracker = updateStepTracker;
+
+// ─── Feature 3: Semantic Zoom ─────────────────────────────────────────────
+// Wires into the existing code graph zoom behavior
+function applySemanticZoom(k, nodeSel, labelSel) {
+  if (!nodeSel || !labelSel) return;
+  if (k < 0.5) {
+    // Show nothing — cluster labels only (handled by cg-cluster-label elements)
+    labelSel.transition().duration(300).style('opacity', 0).style('font-size', '8px');
+  } else if (k < 1.5) {
+    // Show symbol names for exported nodes
+    labelSel.transition().duration(300)
+      .style('opacity', d => d.exported ? 0.8 : 0)
+      .style('font-size', '8px');
+  } else {
+    // Show all labels with full path hint
+    labelSel.transition().duration(300)
+      .style('opacity', 0.8)
+      .style('font-size', '9px');
+  }
+}
+window.applySemanticZoom = applySemanticZoom;
+
+// Hook semantic zoom into existing graph zoom events
+(function patchGraphZoom() {
+  const originalRenderFn = window.renderCodeGraph;
+  if (!originalRenderFn) return;
+  // We'll patch at zoom creation time via the codeGraphEnv
+  const intervalId = setInterval(() => {
+    if (window.codeGraphEnv && window.codeGraphEnv.zoomBehavior) {
+      clearInterval(intervalId);
+      const env = window.codeGraphEnv;
+      const origOn = env.zoomBehavior.on.bind(env.zoomBehavior);
+      env.svg.on('zoom.semantic', (event) => {
+        const { nodeSel, labelSel } = env;
+        if (labelSel) applySemanticZoom(event.transform.k, nodeSel, labelSel);
+      });
+    }
+  }, 500);
+})();
+
+// ─── Feature 3: Impact Overlay (Blast Radius) ─────────────────────────────
+function applyImpactOverlay(clickedNode, links, nodes, nodeSel, linkSel) {
+  if (!nodeSel || !linkSel) return;
+
+  const upstreamIds = new Set();
+  const downstreamIds = new Set();
+  upstreamIds.add(clickedNode.id);
+
+  links.forEach(l => {
+    const sId = l.source.id || l.source;
+    const tId = l.target.id || l.target;
+    if (tId === clickedNode.id) upstreamIds.add(sId);   // callers → red
+    if (sId === clickedNode.id) downstreamIds.add(tId); // callees → yellow
+  });
+
+  nodeSel.select('.cg-node-circle')
+    .transition().duration(400)
+    .attr('fill-opacity', d => {
+      if (d.id === clickedNode.id) return 1;
+      if (upstreamIds.has(d.id)) return 0.9;
+      if (downstreamIds.has(d.id)) return 0.7;
+      return 0.05;
+    })
+    .attr('stroke', d => {
+      if (d.id === clickedNode.id) return d.color;
+      if (upstreamIds.has(d.id)) return 'var(--red)';   // blast radius!
+      if (downstreamIds.has(d.id)) return 'var(--yellow)';
+      return d.color;
+    })
+    .attr('stroke-width', d => {
+      if (d.id === clickedNode.id) return 3;
+      if (upstreamIds.has(d.id) || downstreamIds.has(d.id)) return 2;
+      return 0.5;
+    });
+
+  nodeSel.select('.cg-glow-circle')
+    .transition().duration(400)
+    .attr('fill', d => upstreamIds.has(d.id) ? 'var(--red)' : d.color)
+    .attr('fill-opacity', d => {
+      if (d.id === clickedNode.id) return 0.2;
+      if (upstreamIds.has(d.id)) return 0.25;
+      return 0.02;
+    });
+
+  linkSel.transition().duration(400)
+    .attr('stroke-opacity', l => {
+      const sId = l.source.id || l.source;
+      const tId = l.target.id || l.target;
+      if (upstreamIds.has(sId) && tId === clickedNode.id) return 0.9;
+      if (sId === clickedNode.id && downstreamIds.has(tId)) return 0.7;
+      return 0.02;
+    })
+    .attr('stroke', l => {
+      const sId = l.source.id || l.source;
+      const tId = l.target.id || l.target;
+      if (upstreamIds.has(sId) && tId === clickedNode.id) return 'var(--red)';
+      if (sId === clickedNode.id && downstreamIds.has(tId)) return 'var(--yellow)';
+      return '#333';
+    });
+
+  // Show toast
+  showToast(`🎯 Blast radius: ${upstreamIds.size - 1} upstream caller(s). Red = danger zone.`, 'warn');
+}
+window.applyImpactOverlay = applyImpactOverlay;
+
+// Patch the existing code graph click handler to use impact overlay
+(function patchGraphClick() {
+  let patched = false;
+  const id = setInterval(() => {
+    if (window.codeGraphEnv && !patched) {
+      patched = true;
+      clearInterval(id);
+      const { nodeSel, linkSel, nodes, links, svg } = window.codeGraphEnv;
+      if (!nodeSel) return;
+
+      // Override click with impact overlay
+      nodeSel.on('click.impact', (e, d) => {
+        e.stopPropagation();
+        applyImpactOverlay(d, links, nodes, nodeSel, linkSel);
+      });
+
+      // Reset on background click
+      svg.on('click.impact', () => {
+        nodeSel.select('.cg-node-circle')
+          .transition().duration(300)
+          .attr('fill-opacity', 0.85).attr('stroke', d => d.color).attr('stroke-width', 0.8);
+        nodeSel.select('.cg-glow-circle')
+          .transition().duration(300)
+          .attr('fill', d => d.color).attr('fill-opacity', 0.08);
+        linkSel.transition().duration(300)
+          .attr('stroke-opacity', d => 0.12 + d.conf * 0.25)
+          .attr('stroke', d => { const s = nodes.find(n => n.id === (d.source.id || d.source)); return s ? s.color : '#555'; });
+      });
+    }
+  }, 500);
+})();
+
+// ─── Feature 4: Watercooler Ticker ────────────────────────────────────────
+let tickerMessages = [];
+
+function updateWatercoolerTicker(message) {
+  const ticker = $('watercooler-ticker');
+  const scroll = $('ticker-scroll');
+  if (!ticker || !scroll) return;
+
+  tickerMessages.unshift(message);
+  if (tickerMessages.length > 20) tickerMessages.pop();
+
+  scroll.textContent = tickerMessages.join('  ·  ');
+  ticker.classList.remove('hidden');
+}
+window.updateWatercoolerTicker = updateWatercoolerTicker;
+
+// ─── Feature 1: Header Bloom State ────────────────────────────────────────
+const _headerEl = document.querySelector('header');
+function applyHeaderBloom(state) {
+  if (!_headerEl) return;
+  _headerEl.className = '';
+  if (state && state !== 'idle') _headerEl.classList.add(`state-${state}`);
+}
+window.applyHeaderBloom = applyHeaderBloom;
+
+// Cache sessions list for quick-switch
+function cacheSessionsForQuickSwitch(sessions) {
+  window._lastSessions = sessions;
+}
+window.cacheSessionsForQuickSwitch = cacheSessionsForQuickSwitch;
+

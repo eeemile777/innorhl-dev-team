@@ -390,6 +390,12 @@ header {
   -webkit-backdrop-filter: blur(16px);
 }
 
+/* Header bloom glow when agents are active */
+header.state-running  { box-shadow: 0 0 40px rgba(255,120,31,0.12); border-bottom-color: rgba(255,120,31,0.3); }
+header.state-gemini   { box-shadow: 0 0 40px rgba(167,139,250,0.12); border-bottom-color: rgba(167,139,250,0.3); }
+header.state-reviewing { box-shadow: 0 0 40px rgba(251,191,36,0.12); border-bottom-color: rgba(251,191,36,0.3); }
+header.state-blocked  { box-shadow: 0 0 40px rgba(244,63,94,0.18); border-bottom-color: rgba(244,63,94,0.3); }
+
 .header-left { display: flex; align-items: center; gap: 12px; }
 .header-right { display: flex; align-items: center; gap: 12px; }
 .header-title { font-size: 14px; font-weight: 600; color: var(--text); }
@@ -492,6 +498,13 @@ header {
 
 .bento-cell-span-2 {
   grid-column: span 2;
+}
+
+/* Base bento cell — ensures card styles apply inside grid */
+.bento-cell {
+  display: flex;
+  flex-direction: column;
+  min-height: 140px;
 }
 
 @media (max-width: 1024px) {
@@ -1516,6 +1529,28 @@ header {
   font-size: 13px;
   font-weight: 600;
 }
+.task-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: slide-up 0.35s ease both;
+}
+
+/* Stagger each task-item so they appear sequentially */
+.task-item:nth-child(1)  { animation-delay: 0.05s; }
+.task-item:nth-child(2)  { animation-delay: 0.10s; }
+.task-item:nth-child(3)  { animation-delay: 0.15s; }
+.task-item:nth-child(4)  { animation-delay: 0.20s; }
+.task-item:nth-child(5)  { animation-delay: 0.25s; }
+.task-item:nth-child(6)  { animation-delay: 0.30s; }
+.task-item:nth-child(7)  { animation-delay: 0.35s; }
+.task-item:nth-child(8)  { animation-delay: 0.40s; }
+.task-item:nth-child(9)  { animation-delay: 0.45s; }
+.task-item:nth-child(10) { animation-delay: 0.50s; }
 .stg-header:hover { background: var(--surface-3); }
 .stg-name { flex: 1; }
 
@@ -1765,3 +1800,201 @@ header {
   border-top-left-radius: 0 !important;
   border-top-right-radius: 0 !important;
 }
+
+/* ═══════════════════════════════════════════════════════ */
+/* WAVE 2 ENHANCEMENTS                                     */
+/* ═══════════════════════════════════════════════════════ */
+
+/* ─── FEATURE 1: Resizable Split Panels ─── */
+.agent-flow-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+.split-col {
+  overflow: hidden;
+  min-width: 200px;
+}
+.split-gutter {
+  width: 6px;
+  background: var(--border);
+  cursor: col-resize;
+  transition: background 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.split-gutter:hover { background: var(--accent); }
+.split-gutter::after {
+  content: "";
+  width: 2px;
+  height: 32px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 2px;
+}
+
+/* ─── FEATURE 1: Header Quick-Switch Dropdown ─── */
+.header-session-context.clickable {
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 4px 10px;
+  transition: background 0.2s;
+}
+.header-session-context.clickable:hover { background: var(--surface-2); }
+.header-session-context.clickable::after { content: " ▾"; font-size: 10px; opacity: 0.5; }
+
+.quick-switch-dropdown {
+  position: absolute;
+  top: calc(var(--header-h) + 4px);
+  left: 120px;
+  z-index: 500;
+  background: var(--surface);
+  border: 1px solid var(--border-active);
+  border-radius: var(--radius);
+  padding: 8px;
+  min-width: 260px;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.7);
+  backdrop-filter: blur(16px);
+  animation: slide-up 0.2s ease;
+}
+.qs-item {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: background 0.15s;
+}
+.qs-item:hover { background: var(--surface-2); color: var(--accent); }
+.qs-item.active { color: var(--accent); font-weight: 600; }
+.qs-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--text-muted); padding: 4px 14px 6px; }
+
+/* ─── FEATURE 2: Step Tracker ─── */
+.step-tracker {
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.step-track-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  transition: all 0.3s ease;
+}
+.step-track-item .step-num {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-active);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700;
+  flex-shrink: 0;
+}
+.step-track-item.done { opacity: 0.4; }
+.step-track-item.done .step-num { background: var(--green); border-color: var(--green); color: #000; }
+.step-track-item.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-glow);
+}
+.step-track-item.active .step-num {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 0 12px var(--accent), 0 0 24px var(--accent-glow);
+  animation: step-pulse 1.5s ease-in-out infinite;
+}
+@keyframes step-pulse {
+  0%, 100% { box-shadow: 0 0 6px var(--accent), 0 0 12px var(--accent-glow); }
+  50% { box-shadow: 0 0 16px var(--accent), 0 0 32px var(--accent-glow); }
+}
+
+/* ─── FEATURE 4: Watercooler Ticker ─── */
+.watercooler-ticker {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  background: rgba(13,13,13,0.9);
+  backdrop-filter: blur(16px);
+  border-top: 1px solid var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 0;
+  z-index: 9000;
+  animation: slide-up 0.3s ease;
+}
+.ticker-label {
+  flex-shrink: 0;
+  padding: 0 16px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  border-right: 1px solid var(--border);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  background: rgba(255,120,31,0.05);
+}
+.ticker-scroll-wrap {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  height: 100%;
+}
+.ticker-scroll {
+  display: inline-block;
+  white-space: nowrap;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  padding: 0 20px;
+  line-height: 36px;
+  animation: ticker-marquee 40s linear infinite;
+}
+@keyframes ticker-marquee {
+  0% { transform: translateX(100%); }
+  100% { transform: translateX(-100%); }
+}
+.ticker-close {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 14px;
+  font-size: 12px;
+  height: 100%;
+  transition: color 0.2s;
+}
+.ticker-close:hover { color: var(--text); }
+
+/* ─── FEATURE 5: Monospace Data Areas ─── */
+#live-locks-content,
+.usage-session-list,
+.locks-table,
+.log-output,
+#log-output {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* ─── Code Graph: Semantic Zoom Labels ─── */
+.cg-node-label { opacity: 0; transition: opacity 0.4s ease; }
+.cg-label-visible { opacity: 0.8; }
+
